@@ -174,13 +174,17 @@ async function playNatural(url, side, id, onEnd) {
   src.onended = () => { if (current === src) current = null; onEnd(); };
   current = src; src.start();
 }
+// Chrome garbage-collects an utterance nobody references and then never fires its onend, so the
+// speech manager thought it was still talking and dropped every description after it. Keep a reference.
+let utterance = null;
 function speakBrowser(text, urgent, onEnd) {
   const persona = $('persona').value;                                    // read now, so the toggle is live
   const u = new SpeechSynthesisUtterance(text);
   const v = pickVoice(persona); if (v) { u.voice = v; u.lang = v.lang; }
   const st = VOICE_STYLE[persona] || VOICE_STYLE.calm;
   u.rate = urgent ? 1.2 : st.rate; u.pitch = urgent ? 1.0 : st.pitch;
-  u.onend = u.onerror = onEnd;
+  u.onend = u.onerror = () => { if (utterance === u) utterance = null; onEnd(); };
+  utterance = u;
   speechSynthesis.speak(u);
 }
 
@@ -199,7 +203,7 @@ function play(item) {
   if (item.urgency !== 'answer') logItem(item.urgency, item.text);     // the log shows what was actually said
   const toneMs = earcon(item.side, item.urgency);
   // Chrome sometimes never fires onend; without this a stuck line would block everything below it.
-  setTimeout(() => finished(id), toneMs + 2500 + 110 * item.text.length);
+  setTimeout(() => finished(id), toneMs + 1500 + 85 * item.text.length);
   setTimeout(async () => {                                               // tone first, then the voice
     if (id !== playId) return;
     if (item.audioUrl) {

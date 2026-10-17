@@ -458,25 +458,34 @@ def _maybe_narrate(caption: str) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
+_recent_narration: list[str] = []         # last few narrated lines, so the model doesn't repeat itself
+
+
 def _narrate(previous: str, caption: str) -> AgentLine | None:
+    # Earlier prompt allowed only actions, so it talked about the person and never the place
+    # ("A man is speaking." x5). Now: what's happening, or what the place looks like when the view changes.
     sysmsg = _system(
-        "You tell a blind person what is HAPPENING around them, from a description of the last few seconds.\n"
-        "Say ONE short sentence when something happens they'd want to know: someone waves, points, gestures, "
-        "talks to them, holds something out, sits down, stands up, walks toward or away; a door opens; or they're "
-        "now somewhere new (another room, a corridor, outside, stairs).\n"
-        "Reply with only the word SILENT when nothing new is happening, when the description only lists objects "
-        "(those are announced separately), or when it repeats the last thing said.\n"
-        "The camera is the person's eyes: 'at the camera' means 'at you'. Keep where it happens (on your left / "
-        "on your right / ahead) whenever the description says. Facts from the description only, never 'centre'. "
-        "Your reply is spoken aloud as-is.")
-    user = f"Previous description: {previous or '(none)'}\nNew description: {caption}\nLast thing said: {_last_text!r}"
+        "You are a blind person's eyes, narrating live from a description of the last few seconds.\n"
+        "Say ONE short sentence (under 20 words) with the most useful NEW thing:\n"
+        "- something happening: someone waves, points, talks to them, holds something out, sits, stands, walks "
+        "toward or away, a door opens;\n"
+        "- or, when the view has changed, what the place is like: the kind of room or place, what's ahead, on the "
+        "left and on the right (windows, doors, stairs, furniture, screens, light).\n"
+        "Prefer the surroundings over describing the same person again.\n"
+        "Reply with only the word SILENT if nothing is new compared with the previous description and the recent lines.\n"
+        "The camera is the person's eyes: 'at the camera' means 'at you'. Say on your left / on your right / ahead, "
+        "never 'centre'. Facts from the description only. Your reply is spoken aloud as-is.")
+    user = (f"Previous description: {previous or '(none)'}\nNew description: {caption}\n"
+            f"Recently said: {json.dumps(_recent_narration[-4:])}")
     try:
         text = _complete(sysmsg, user)
     except Exception as e:
         print("narration: LLM failed, staying silent:", e)
         return None
-    if not text or text.upper().startswith("SILENT") or text == _last_text:
+    if not text or text.upper().startswith("SILENT") or text in _recent_narration:
         return None
+    _recent_narration.append(text)
+    del _recent_narration[:-6]
     side = "left" if "left" in text.lower() else "right" if "right" in text.lower() else None
     return {"text": text, "side": side, "urgency": "info"}
 
