@@ -71,3 +71,7 @@ ELEVEN_VOICE_DOC = os.getenv("ELEVEN_VOICE_DOC", "JBFqnCBsd6RMkjVDRZzb")    # Ge
 WANDB_TEAM = os.getenv("WANDB_TEAM", "")
 if WANDB_PROJECT and "/" not in WANDB_PROJECT and WANDB_TEAM:
     WANDB_PROJECT = f"{WANDB_TEAM}/{WANDB_PROJECT}"
+
+# YOLO closing (owner B): box area now vs this many seconds ago. Replaces SMOOTH_FRAMES, which meant a
+# different time at every frame rate (5 fps through the tunnel vs 30 locally).
+CLOSING_WINDOW_S = float(os.getenv("CLOSING_WINDOW_S", "0.6"))

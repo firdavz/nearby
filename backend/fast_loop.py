@@ -2,7 +2,7 @@
 
 FAKE: a 'person' box that drifts toward the camera so the hazard path can be tested.
 REAL: Ultralytics YOLO + ByteTrack; side from box centre, distance from box height,
-closing from box-area growth over the last SMOOTH_FRAMES frames per track.
+closing from box-area growth over the last CLOSING_WINDOW_S seconds per track.
 """
 from __future__ import annotations
 
@@ -25,16 +25,20 @@ def distance_of(box, H) -> str:
     return "near" if h > config.NEAR_FRAC else "mid" if h > config.MID_FRAC else "far"
 
 
-_hist: dict[int, deque] = defaultdict(lambda: deque(maxlen=config.SMOOTH_FRAMES))
+_hist: dict[int, deque] = defaultdict(lambda: deque(maxlen=60))   # (time, area) per track
 
 
 def closing_of(track_id: int, box) -> bool:
-    """Box area now vs mean area over the window. Smoothed → no alarm when standing still."""
+    """Box area now vs CLOSING_WINDOW_S ago, so it means the same at 5 fps through the tunnel
+    and at 30 fps locally. Needs half a window of history → no alarm from one jittery frame."""
+    now = time.time()
     area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
     h = _hist[track_id]
-    oldest = h[0] if len(h) >= 3 else None
-    h.append(area)
-    return oldest is not None and area / oldest > config.CLOSING_GROWTH
+    h.append((now, area))
+    while len(h) > 1 and now - h[1][0] >= config.CLOSING_WINDOW_S:
+        h.popleft()   # keep exactly one sample at least a window old
+    t0, a0 = h[0]
+    return now - t0 >= config.CLOSING_WINDOW_S / 2 and area / a0 > config.CLOSING_GROWTH
 
 
 # --------------------------------------------------------------------------- FAKE
