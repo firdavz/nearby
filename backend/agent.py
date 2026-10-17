@@ -23,7 +23,8 @@ PERSONAS = {
 # Appended LAST to every system prompt so the voice survives the task rules. Each must still say where.
 # No locations in these: the model copied example locations into real answers.
 VOICE = {
-    "calm": "Voice: calm and plain, like a trusted friend.",
+    "calm": ("Voice: relaxed and natural, like a friend talking — contractions (they're, you've), "
+             "everyday words, no formal phrasing."),
     "attenborough": ("Voice: a hushed, awe-struck nature-documentary narrator, treating everyday objects as rare "
                      "wildlife (words like 'behold', 'remarkable', 'in its natural habitat'). Vary your phrasing."),
 }
@@ -207,7 +208,7 @@ def memory_lookup(question: str) -> dict:
 
 _pending: dict = {"line": None, "t": 0.0}
 _thinking = {"busy": False, "last": 0.0}
-PENDING_MAX_AGE_S = 4.0   # a chatter line older than this is stale, drop it
+PENDING_MAX_AGE_S = 7.0   # a chatter line older than this is stale, drop it (includes ~3 s voice render)
 
 
 def agent_on_events_real(events: list[Detection], caption: str) -> AgentLine | None:

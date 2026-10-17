@@ -28,6 +28,12 @@ def _voice_id(persona: str) -> str:
     return config.ELEVEN_VOICE_DOC if persona == "attenborough" else config.ELEVEN_VOICE_CALM
 
 
+def _settings(persona: str) -> dict:
+    if config.ELEVEN_MODEL == "eleven_v3":   # v3 only takes stability (0.0 creative / 0.5 natural / 1.0 robust)
+        return {"stability": 0.5}
+    return {"stability": 0.5, "similarity_boost": 0.75, "style": 0.35 if persona == "attenborough" else 0.0}
+
+
 def _path(text: str, voice_id: str):
     h = hashlib.sha1(f"{voice_id}|{config.ELEVEN_MODEL}|{text}".encode()).hexdigest()[:16]
     return config.CLIP_DIR / f"tts_{h}.mp3"
@@ -52,10 +58,8 @@ def tts(text: str, persona: str = "calm") -> str | None:
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
             params={"output_format": "mp3_44100_64"},
             headers={"xi-api-key": config.ELEVENLABS_API_KEY},
-            json={"text": text, "model_id": config.ELEVEN_MODEL,
-                  "voice_settings": {"stability": 0.5, "similarity_boost": 0.75,
-                                     "style": 0.35 if persona == "attenborough" else 0.0}},
-            timeout=6,
+            json={"text": text, "model_id": config.ELEVEN_MODEL, "voice_settings": _settings(persona)},
+            timeout=12,
         )
         if r.status_code in (401, 402, 403):   # bad key or out of credits: retrying won't help
             _off["why"] = f"HTTP {r.status_code}: {r.text[:160]}"
