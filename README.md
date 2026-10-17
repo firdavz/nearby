@@ -44,6 +44,10 @@ Everything is one Python process. Modules are plain functions. Slow calls run in
 Every module has a **fake** and a **real** implementation. Flags in `.env`:
 `USE_REAL_YOLO`, `USE_REAL_COSMOS`, `USE_REAL_MEMORY`, `USE_REAL_LLM`. Flip each to `1` once it's proven; flip back for the demo if it misbehaves.
 
+Captions without Cosmos: `USE_REAL_COSMOS=1` + `COSMOS_MODE=yolo` builds captions from the detections seen in each clip
+("A cup on your right, mid; a person on your left, near."). `COSMOS_MODE=nvcf` (hosted) or `openai` (self-hosted NIM) call
+Cosmos Reason and fall back to the YOLO template on any error.
+
 ## Behaviour rules already built in
 
 - **Hazard = closing + near.** Fixed text, never waits for the LLM. Repeats at most every 2 s while the danger persists.
