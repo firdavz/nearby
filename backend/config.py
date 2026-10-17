@@ -58,7 +58,7 @@ VAST_BUCKET = os.getenv("VAST_BUCKET", "second-sight")
 
 # Agent behaviour
 PERSONA = os.getenv("PERSONA", "calm")          # calm | attenborough
-SPEAK_COOLDOWN_S = float(os.getenv("SPEAK_COOLDOWN_S", "10"))   # min gap between chatter lines (hazards ignore it)
+SPEAK_COOLDOWN_S = float(os.getenv("SPEAK_COOLDOWN_S", "6"))    # min gap between narration lines (hazards/arrivals ignore it)
 
 # ElevenLabs voices (owner C). Blank key → browser speech, as before.
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")

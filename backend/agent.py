@@ -45,7 +45,6 @@ HAZARD_REPEAT_S = 8.0   # the same danger, still there, is repeated at most this
 HAZARD_GONE_S = 2.0     # if a danger vanishes for this long and comes back, warn again at once
 HAZARD_MIN_GAP_S = 4.0  # never two warnings closer than this, whatever they are (2.5 s still felt like nagging)
 ANSWER_QUIET_S = 8.0    # chatter holds off this long around a question, so the answer stands alone
-NOVELTY_S = 45.0        # chatter won't mention the same kind of object again within this window
 
 # Priority among dangers seen at once: fast movers, then bikes, then people/animals, then obstacles;
 # in your path (centre) before off to the side; the bigger (closer) box first.
@@ -120,23 +119,143 @@ def set_latest_caption(c: str) -> None:
     _latest_caption = c
 
 
-def _rate_ok() -> bool:
-    """May the agent chatter now? Not during the cooldown, and not around a user question."""
-    now = time.time()
-    return now - _last_spoke > config.SPEAK_COOLDOWN_S and now >= _quiet_until
-
-
 def _hold_chatter(seconds: float) -> None:
     global _quiet_until
     _quiet_until = max(_quiet_until, time.time() + seconds)
-    _pending["line"] = None   # anything queued before the question is stale now
+    with _ready_lock:
+        _ready.clear()        # anything queued before the question is stale now
 
 
-_announced: dict[str, float] = {}   # object label -> when chatter last mentioned it
+# ---------------------------------------------------------------------------- live narration
+# It used to say only "someone's coming at you". Two layers now, both below hazards in priority:
+#   1. arrivals — instant, from YOLO, no model: "There's a chair in front of you." "Someone's on your left."
+#      Said once when something comes into view, not again while it stays.
+#   2. actions — from Cosmos's clip description, worded by the W&B model: "The man ahead is waving at you."
+# Lines are voiced off the frame loop (ElevenLabs takes ~1-3 s) and handed over on a later frame.
+ARRIVAL_STABLE_S = 0.6    # in view at least this long (ignores one-frame flickers)
+ARRIVAL_GAP_S = 3.0       # at most one arrival line every few seconds
+ARRIVAL_AGAIN_S = 20.0    # something that left and came back is announced again, but not sooner than this
+READY_MAX_AGE_S = 7.0     # a voiced line older than this is stale, drop it
+_SKIP_LABELS = {"tie", "train", "airplane", "boat", "kite", "frisbee", "surfboard", "skis", "snowboard"}  # indoor misdetections
+_FRIENDLY = {"dining table": "table", "potted plant": "plant", "cell phone": "phone", "tv": "TV",
+             "handbag": "bag", "wine glass": "glass", "sports ball": "ball"}
+_COUNT = {2: "Two", 3: "Three"}
+_present: dict[str, dict] = {}            # label -> since / last seen / last announced
+_last_arrival = 0.0
+_ready: list[dict] = []                   # voiced lines waiting for the next frame
+_ready_lock = threading.Lock()
 
 
-def _is_new(label: str) -> bool:
-    return time.time() - _announced.get(label, 0.0) > NOVELTY_S
+def _deliver(line: AgentLine) -> None:
+    """Voice a line in the background, then hand it to the next frame."""
+    def run():
+        line["audio_url"] = voice.tts(line["text"], config.PERSONA)
+        with _ready_lock:
+            _ready.append({"line": line, "t": time.time()})
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _take_ready() -> AgentLine | None:
+    now = time.time()
+    with _ready_lock:
+        _ready[:] = [r for r in _ready if now - r["t"] < READY_MAX_AGE_S]
+        if not _ready or now < _quiet_until:
+            return None
+        _ready.sort(key=lambda r: r["line"]["urgency"] != "warn")   # close things first
+        line = _ready.pop(0)["line"]
+    _said(line["text"])
+    return line
+
+
+def _where(d: Detection) -> str:
+    side = d["side"]
+    if d["distance"] == "near":
+        return "right in front of you" if side == "centre" else f"close on your {side}"
+    if d["distance"] == "far":
+        return "further ahead" if side == "centre" else f"over on your {side}"
+    return "ahead of you" if side == "centre" else f"on your {side}"
+
+
+def _plural(noun: str) -> str:
+    return noun + ("es" if noun.endswith(("s", "sh", "ch", "x")) else "s")
+
+
+def _arrival_text(label: str, dets: list[Detection]) -> str:
+    where = _where(max(dets, key=lambda e: (e["box"][2] - e["box"][0]) * (e["box"][3] - e["box"][1])))
+    n = len(dets)
+    if label == "person":
+        return f"Someone's {where}." if n == 1 else f"{_COUNT.get(n, 'A few')} people {where}."
+    noun = _FRIENDLY.get(label, label)
+    if n == 1:
+        return f"There's {'an' if noun[0] in 'aeiou' else 'a'} {noun} {where}."
+    return f"{_COUNT.get(n, 'A few')} {_plural(noun)} {where}."
+
+
+def _arrival(events: list[Detection]) -> None:
+    """Announce what has just come into view: people first, then things in your path, nearest first."""
+    global _last_arrival
+    now = time.time()
+    groups: dict[str, list[Detection]] = {}
+    for d in events:
+        if d["label"] not in _SKIP_LABELS:
+            groups.setdefault(d["label"], []).append(d)
+    for label, dets in groups.items():
+        p = _present.setdefault(label, {"since": now, "last": now, "announced": 0.0, "n": 0, "n_since": now, "n_told": 0})
+        if now - p["last"] > 1.5:             # it had gone: a new arrival
+            p["since"], p["n_told"] = now, 0
+        p["last"] = now
+        if len(dets) != p["n"]:
+            p["n"], p["n_since"] = len(dets), now
+        if p["n"] < p["n_told"] and now - p["n_since"] >= ARRIVAL_STABLE_S:
+            p["n_told"] = p["n"]              # one walked off: quietly lower the bar, so a newcomer counts
+    if now - _last_arrival < ARRIVAL_GAP_S or now < _quiet_until:
+        return
+    found = []                                # (label, dets, kind)
+    for label, dets in groups.items():
+        p = _present[label]
+        if p["announced"] < p["since"] and now - p["since"] >= ARRIVAL_STABLE_S and now - p["announced"] > ARRIVAL_AGAIN_S:
+            found.append((label, dets, "arrived"))
+        elif 0 < p["n_told"] < p["n"] and now - p["n_since"] >= ARRIVAL_STABLE_S:
+            found.append((label, dets, "another"))   # e.g. a second person walks in while the first is still there
+    if not found:
+        return
+    dist = {"near": 0, "mid": 1, "far": 2}
+    label, dets, kind = min(found, key=lambda g: (0 if g[0] in _MOVERS else 1 if g[0] in _OBSTACLES else 2,
+                                                  min(dist[d["distance"]] for d in g[1]),
+                                                  0 if any(d["side"] == "centre" for d in g[1]) else 1))
+    p = _present[label]
+    added = p["n"] - p["n_told"]
+    p["announced"], p["n_told"] = now, p["n"]
+    _last_arrival = now
+    if kind == "another":
+        d = max(dets, key=lambda e: e["track_id"])   # the tracker numbers new objects upward: newest = highest id
+        noun = _FRIENDLY.get(label, label)
+        if added == 1:
+            text = f"Someone else, {_where(d)}." if label == "person" else f"Another {noun}, {_where(d)}."
+        else:
+            more = "people" if label == "person" else _plural(noun)
+            text = f"{_COUNT.get(added, 'A few')} more {more}, {_where(d)}."
+    else:
+        d = max(dets, key=lambda e: (e["box"][2] - e["box"][0]) * (e["box"][3] - e["box"][1]))
+        text = _arrival_text(label, dets)
+    _deliver({"text": text, "side": d["side"], "urgency": "warn" if d["distance"] == "near" else "info"})
+
+
+def _live(events: list[Detection], caption: str, narrate: bool) -> AgentLine | None:
+    """Every frame: hazards first (instant), then any voiced line that's ready; meanwhile queue new
+    arrivals and, with the real model, narration of what's happening."""
+    line = _hazard_line(events)
+    if line:
+        with _ready_lock:
+            _ready.clear()                     # chatter queued before a warning is stale
+        return line
+    line = _take_ready()
+    if line:
+        return line
+    _arrival(events)
+    if narrate:
+        _maybe_narrate(caption)
+    return None
 
 
 def _said(text: str) -> None:
@@ -171,19 +290,7 @@ def _fmt_t(t: float) -> str:
 
 # --------------------------------------------------------------------------- FAKE
 def agent_on_events_fake(events: list[Detection], caption: str) -> AgentLine | None:
-    line = _hazard_line(events)
-    if line:
-        return line
-    if not _rate_ok():
-        return None
-    near = [e for e in events if e["distance"] == "near" and _is_new(e["label"])]
-    if near:
-        e = near[0]
-        text = f"{e['label']} close on your {e['side']}." if e["side"] != "centre" else f"{e['label']} directly ahead."
-        if text != _last_text:
-            _said(text); _announced[e["label"]] = time.time()
-            return {"text": text, "side": e["side"], "urgency": "warn"}
-    return None
+    return _live(events, caption, narrate=False)
 
 
 # A's newer memory features, used when present (getattr) so this file works before and after A's push:
@@ -324,75 +431,53 @@ def memory_lookup(question: str) -> dict:
     return {"facts": facts, "clip_url": clip}
 
 
-_pending: dict = {"line": None, "t": 0.0}
-_thinking = {"busy": False, "last": 0.0}
-PENDING_MAX_AGE_S = 7.0   # a chatter line older than this is stale, drop it (includes ~3 s voice render)
-
-
 def agent_on_events_real(events: list[Detection], caption: str) -> AgentLine | None:
-    """Called on every frame, so it must return instantly. The LLM runs in a background
-    thread; its line (if any) is handed back on a later frame."""
-    line = _hazard_line(events)  # never wait for a model
-    if line:
-        _pending["line"] = None
-        return line
-    if _pending["line"]:
-        line, _pending["line"] = _pending["line"], None
-        if time.time() - _pending["t"] < PENDING_MAX_AGE_S and _rate_ok():
-            _said(line["text"])
-            return line
-        return None
+    """Called on every frame, so it must return instantly; the model runs in a background thread."""
+    return _live(events, caption, narrate=True)
+
+
+_narrating = {"busy": False, "last": 0.0, "caption": ""}
+
+
+def _maybe_narrate(caption: str) -> None:
+    """On each new Cosmos description, ask the model whether something is happening worth saying."""
     now = time.time()
-    if _thinking["busy"] or not _rate_ok() or now - _thinking["last"] < config.SPEAK_COOLDOWN_S:
-        return None
-    _thinking.update(busy=True, last=now)
-    threading.Thread(target=_think, args=(list(events), caption), daemon=True).start()
-    return None
+    if (not caption or caption == _narrating["caption"] or _narrating["busy"] or now < _quiet_until
+            or now - _narrating["last"] < config.SPEAK_COOLDOWN_S):
+        return
+    previous, _narrating["caption"] = _narrating["caption"], caption
+    _narrating.update(busy=True, last=now)
+
+    def run():
+        try:
+            line = _narrate(previous, caption)
+            if line:
+                _deliver(line)
+        finally:
+            _narrating["busy"] = False
+    threading.Thread(target=run, daemon=True).start()
 
 
-def _think(events: list[Detection], caption: str) -> None:
-    try:
-        line = _decide(events, caption)
-        if line:
-            line["audio_url"] = voice.tts(line["text"], config.PERSONA)  # render here, off the frame loop
-            _pending.update(line=line, t=time.time())
-    finally:
-        _thinking["busy"] = False
-
-
-_last_decided_caption = ""
-
-
-def _decide(events: list[Detection], caption: str) -> AgentLine | None:
-    global _last_decided_caption
-    # Only things not mentioned recently; and if nothing is new and the scene hasn't changed,
-    # there is nothing to say — skip the model call entirely.
-    near = [e for e in events if e["distance"] != "far" and _is_new(e["label"])]
-    scene_changed = bool(caption) and caption != _last_decided_caption
-    _last_decided_caption = caption
-    if not near and not scene_changed:
-        return None
+def _narrate(previous: str, caption: str) -> AgentLine | None:
     sysmsg = _system(
-        "Decide if the person needs to hear anything right now.\n"
-        "Say one short sentence, with left/right/ahead, when: an object is near them that they may want "
-        "or bump into (a cup, keys, phone, bag, chair in their path); a person comes close; or the scene "
-        "changes (new room, door, stairs, step, crossing).\n"
-        "Reply with only the word SILENT when: things are far away, the scene is unchanged, or it repeats "
-        "what was last said.\n"
-        "Your reply is spoken aloud as-is: no labels, no quotes, no explanation.")
-    # plain-English positions: the raw "side": "centre" came out as "on the centre side"
-    objs = [{"label": e["label"], "where": _SIDE_WORDS.get(e["side"], "ahead"), "distance": e["distance"]} for e in near]
-    user = f"Objects: {json.dumps(objs)}\nScene: {caption}\nLast thing said: {_last_text!r}"
+        "You tell a blind person what is HAPPENING around them, from a description of the last few seconds.\n"
+        "Say ONE short sentence when something happens they'd want to know: someone waves, points, gestures, "
+        "talks to them, holds something out, sits down, stands up, walks toward or away; a door opens; or they're "
+        "now somewhere new (another room, a corridor, outside, stairs).\n"
+        "Reply with only the word SILENT when nothing new is happening, when the description only lists objects "
+        "(those are announced separately), or when it repeats the last thing said.\n"
+        "The camera is the person's eyes: 'at the camera' means 'at you'. Keep where it happens (on your left / "
+        "on your right / ahead) whenever the description says. Facts from the description only, never 'centre'. "
+        "Your reply is spoken aloud as-is.")
+    user = f"Previous description: {previous or '(none)'}\nNew description: {caption}\nLast thing said: {_last_text!r}"
     try:
         text = _complete(sysmsg, user)
     except Exception as e:
-        print("agent_on_events_real: LLM failed, staying silent:", e)
+        print("narration: LLM failed, staying silent:", e)
         return None
     if not text or text.upper().startswith("SILENT") or text == _last_text:
         return None
-    side = near[0]["side"] if near else None
-    for e in near:
-        _announced[e["label"]] = time.time()
+    side = "left" if "left" in text.lower() else "right" if "right" in text.lower() else None
     return {"text": text, "side": side, "urgency": "info"}
 
 
