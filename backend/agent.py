@@ -10,6 +10,7 @@ REAL: memory_lookup (last_seen + search + live caption) runs in code, then a W&B
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 
@@ -169,6 +170,32 @@ def agent_on_events_fake(events: list[Detection], caption: str) -> AgentLine | N
     return None
 
 
+# A's newer memory features, used when present (getattr) so this file works before and after A's push:
+#   recall(q) -> list[MemoryHit]   like search(), but understands times ("ten minutes ago")
+#   parse_remember(q) -> note|None + remember(note)   "remember that I parked on level 3"
+#   recap(minutes=15) -> str       "what did I miss?"
+# "what happened to my cup?" is a question about the cup, not a recap, hence (?! to\b).
+_RECAP_RE = re.compile(r"while i was (away|gone|out)|what('s| has)? happened(?! to\b)|what did i miss|recap", re.I)
+
+
+def _recall(question: str):
+    return (getattr(memory, "recall", None) or memory.search)(question)
+
+
+def _memory_command(question: str) -> AgentAnswer | None:
+    """'Remember ...' notes and 'what did I miss?' recaps, answered straight from A's memory."""
+    parse, remember = getattr(memory, "parse_remember", None), getattr(memory, "remember", None)
+    if parse and remember:
+        note = parse(question)
+        if note:
+            remember(note)
+            return {"text": "Got it, I'll remember that.", "clip_url": None}
+    recap = getattr(memory, "recap", None)
+    if recap and _RECAP_RE.search(question):
+        return {"text": recap(minutes=15), "clip_url": None}
+    return None
+
+
 OBJECT_WORDS = ("keys", "phone", "wallet", "glasses", "cup", "bag", "backpack", "bottle", "laptop")
 PLURAL_WORDS = ("keys", "glasses")
 # A's memory adds an optional hit["side"]: where the object was in view when it was last seen.
@@ -193,7 +220,7 @@ def agent_ask_fake(question: str) -> AgentAnswer:
             return {"text": f"I haven't seen your {word} yet.", "clip_url": None}
     if "see" in q or "now" in q or "around" in q:
         return {"text": _latest_caption or "I can't see anything yet.", "clip_url": None}
-    hits = memory.search(question)
+    hits = _recall(question)
     if hits:
         return {"text": f"{_fmt_t(hits[0]['t'])}: {hits[0]['caption']}", "clip_url": hits[0]["clip_url"]}
     return {"text": "I don't have anything about that.", "clip_url": None}
@@ -273,7 +300,7 @@ def memory_lookup(question: str) -> dict:
         else:
             facts.append(f"last_seen({word}): never seen")
     if not asked and not _is_now_question(q):  # a named object never seen must not borrow another clip
-        for h in memory.search(question)[:3]:
+        for h in _recall(question)[:3]:
             facts.append(f"memory: {h['caption']} [time: {_fmt_t(h['t'])}]")
             clip = clip or h["clip_url"]
     if not asked or _is_now_question(q):   # for "where is my X" the live scene only confuses the model
@@ -389,7 +416,7 @@ def agent_on_events(events: list[Detection], caption: str) -> AgentLine | None:
 def agent_ask(question: str) -> AgentAnswer:
     """The user's question outranks chatter: it's held off while we answer and for a while after."""
     _hold_chatter(ANSWER_QUIET_S)
-    ans = _ask(question)
+    ans = _memory_command(question) or _ask(question)
     ans["audio_url"] = voice.tts(ans["text"], config.PERSONA)
     _hold_chatter(ANSWER_QUIET_S)
     global _last_text
