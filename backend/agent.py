@@ -38,18 +38,23 @@ def _system(task: str) -> str:
 _last_spoke = 0.0
 _last_text = ""
 _latest_caption = ""
-_last_hazard = {"t": 0.0, "text": ""}
-HAZARD_REPEAT_S = 2.0   # an urgent warning repeats at most this often while the danger persists
+_last_hazard = {"t": 0.0, "text": "", "seen": 0.0}
+HAZARD_REPEAT_S = 8.0   # the same danger, still there, is repeated at most this often
+HAZARD_GONE_S = 2.0     # if a danger vanishes for this long and comes back, warn again at once
 
 
 def _hazard_line(events: list[Detection]) -> AgentLine | None:
-    """Fast path. Bypasses the chatter cooldown but won't machine-gun the same warning."""
+    """Fast path. Bypasses the chatter cooldown but warns once per danger, not every frame:
+    a continuous warning drowned out everything else, including answers to questions."""
     hazards = [e for e in events if is_hazard(e)]
     if not hazards:
         return None
     line = fixed_alert(hazards[0])
     now = time.time()
-    if line["text"] == _last_hazard["text"] and now - _last_hazard["t"] < HAZARD_REPEAT_S:
+    same = line["text"] == _last_hazard["text"]
+    continuous = now - _last_hazard["seen"] < HAZARD_GONE_S
+    _last_hazard["seen"] = now
+    if same and continuous and now - _last_hazard["t"] < HAZARD_REPEAT_S:
         return None
     _last_hazard.update(t=now, text=line["text"])
     _said(line["text"])
