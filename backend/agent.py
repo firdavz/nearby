@@ -43,7 +43,7 @@ _latest_caption = ""
 _quiet_until = 0.0      # no chatter before this (set around a user question)
 HAZARD_REPEAT_S = 8.0   # the same danger, still there, is repeated at most this often
 HAZARD_GONE_S = 2.0     # if a danger vanishes for this long and comes back, warn again at once
-HAZARD_MIN_GAP_S = 2.5  # never two warnings closer than this, whatever they are
+HAZARD_MIN_GAP_S = 4.0  # never two warnings closer than this, whatever they are (2.5 s still felt like nagging)
 ANSWER_QUIET_S = 8.0    # chatter holds off this long around a question, so the answer stands alone
 NOVELTY_S = 45.0        # chatter won't mention the same kind of object again within this window
 
@@ -57,6 +57,20 @@ _last_warning = 0.0
 # A real approach comes from further away, so it has only just become near when it closes in.
 NEAR_FRESH_S = 3.0      # only warn about something that became near within the last few seconds
 _near: dict[str, dict] = {}               # per object: since when it has been near, and last seen near
+
+
+# What deserves an urgent warning. Things that move can hit you from any side. Things that don't move
+# only matter in your path, and only if you could walk into them: on the VM, "a laptop just to your
+# left", "a chair just to your right" and a misdetected indoor "train" were all urgent warnings.
+_MOVERS = {"person", "bicycle", "car", "motorcycle", "bus", "truck", "dog"}
+_OBSTACLES = {"chair", "couch", "bench", "dining table", "potted plant", "bed", "suitcase", "fire hydrant",
+              "stop sign", "parking meter", "refrigerator", "toilet"}
+
+
+def _worth_warning(d: Detection) -> bool:
+    if d["label"] in _MOVERS:
+        return True
+    return d["label"] in _OBSTACLES and d["side"] == "centre"
 
 
 def _key(d: Detection) -> str:
@@ -80,14 +94,16 @@ def _hazard_line(events: list[Detection]) -> AgentLine | None:
                 st["since"] = now
             st["last"] = now
     due = []
-    for d in sorted((e for e in events if is_hazard(e)), key=_danger_rank):
+    for d in sorted((e for e in events if is_hazard(e) and _worth_warning(e)), key=_danger_rank):
         key = _key(d)
-        if now - _near[key]["since"] > NEAR_FRESH_S:
-            continue                      # been right there for a while: not a new danger
-        h = _hazards.setdefault(key, {"warned": 0.0, "seen": 0.0})
+        h = _hazards.setdefault(key, {"warned": 0.0, "seen": 0.0, "eligible": False})
         returning = now - h["seen"] > HAZARD_GONE_S
+        if returning:
+            # Decide once, when it becomes a danger: a fresh arrival, or someone already sat right there?
+            # Deciding on every frame dropped a second danger that had to wait out HAZARD_MIN_GAP_S.
+            h["eligible"] = now - _near[key]["since"] <= NEAR_FRESH_S
         h["seen"] = now
-        if returning or now - h["warned"] > HAZARD_REPEAT_S:
+        if h["eligible"] and (returning or now - h["warned"] > HAZARD_REPEAT_S):
             due.append((d, h))
     if not due or now - _last_warning < HAZARD_MIN_GAP_S:
         return None
@@ -364,7 +380,9 @@ def _decide(events: list[Detection], caption: str) -> AgentLine | None:
         "Reply with only the word SILENT when: things are far away, the scene is unchanged, or it repeats "
         "what was last said.\n"
         "Your reply is spoken aloud as-is: no labels, no quotes, no explanation.")
-    user = f"Objects: {json.dumps([{k: e[k] for k in ('label', 'side', 'distance')} for e in near])}\nScene: {caption}\nLast thing said: {_last_text!r}"
+    # plain-English positions: the raw "side": "centre" came out as "on the centre side"
+    objs = [{"label": e["label"], "where": _SIDE_WORDS.get(e["side"], "ahead"), "distance": e["distance"]} for e in near]
+    user = f"Objects: {json.dumps(objs)}\nScene: {caption}\nLast thing said: {_last_text!r}"
     try:
         text = _complete(sysmsg, user)
     except Exception as e:
