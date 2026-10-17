@@ -57,3 +57,34 @@ def is_hazard(d: Detection) -> bool:
 def fixed_alert(d: Detection) -> AgentLine:
     """Urgent alerts use fixed text so a slow model never delays a warning."""
     return {"text": f"{d['label']}, {d['side']}, {d['distance']}", "side": d["side"], "urgency": "urgent"}
+
+
+# ---- scene-level rule: crowding (fast path, no LLM) ---------------------------
+# Several near/mid objects ahead → "busy ahead" with the clearer side. Added after the
+# contract was agreed; it adds a function, it changes no shapes.
+CROWD_AHEAD = 2      # near/mid objects in the centre third
+CROWD_TOTAL = 4      # or this many near/mid objects anywhere
+_crowd_state = {"t": 0.0}
+CROWD_REPEAT_S = 5.0
+
+
+def clearer_side(dets: list[Detection]) -> Side:
+    load = {"left": 0, "right": 0}
+    for d in dets:
+        if d["distance"] != "far" and d["side"] in load:
+            load[d["side"]] += 1
+    return "left" if load["left"] <= load["right"] else "right"
+
+
+def crowd_alert(dets: list[Detection]) -> AgentLine | None:
+    import time
+    close = [d for d in dets if d["distance"] in ("near", "mid")]
+    ahead = [d for d in close if d["side"] == "centre"]
+    if len(ahead) < CROWD_AHEAD and len(close) < CROWD_TOTAL:
+        return None
+    now = time.time()
+    if now - _crowd_state["t"] < CROWD_REPEAT_S:
+        return None
+    _crowd_state["t"] = now
+    side = clearer_side(dets)
+    return {"text": f"busy ahead, slow down. clearer on the {side}", "side": side, "urgency": "warn"}

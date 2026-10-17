@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import agent, config, fast_loop, memory, slow_loop
-from backend.contracts import is_hazard
+from backend.contracts import crowd_alert, is_hazard
 
 app = FastAPI(title="Second Sight")
 config.CLIP_DIR.mkdir(parents=True, exist_ok=True)
@@ -177,7 +177,8 @@ async def ws_frames(ws: WebSocket):
             dets = await asyncio.to_thread(fast_loop.detect, frame)
             seen_labels.update(d["label"] for d in dets)
             clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets)
-            line = agent.agent_on_events(dets, _state["latest_caption"])
+            # scene-level crowding rule first (fast path, fixed text); otherwise C's per-object hazards + chatter
+            line = crowd_alert(dets) or agent.agent_on_events(dets, _state["latest_caption"])
             if line:
                 with _lock:
                     _log.append({"t": t, "kind": line["urgency"], "text": line["text"]})
@@ -201,7 +202,7 @@ async def ws_frames(ws: WebSocket):
             await ws.send_text(json.dumps({
                 "detections": dets, "hazard": flash,
                 "say": line, "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
-                "dropped": dropped,
+                "dropped": dropped, "crowded": sum(d["distance"] != "far" for d in dets) >= 3,
             }))
     except WebSocketDisconnect:
         pass

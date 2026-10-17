@@ -93,7 +93,9 @@ def caption_fake(clip_path: str) -> str:
 PROMPT = ("You are the eyes of a person with sight loss. Describe this short clip in one or two plain sentences: "
           "the main objects and where they are (left/right/ahead, near/far), any people and what they are doing, "
           "and anything that could be a hazard. Name small personal items explicitly if visible "
-          "(keys, phone, wallet, glasses, cup, bag). Answer directly, no preamble, no reasoning steps.")
+          "(keys, phone, wallet, glasses, cup, bag). Finish with one short sentence starting 'Path ahead:' — "
+          "say whether the way forward is clear or busy, and if busy, which side is clearer. "
+          "Answer directly, no preamble, no reasoning steps.")
 
 
 def _clean(text: str) -> str:
