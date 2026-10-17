@@ -18,8 +18,13 @@
   .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3 }
   .stage video, .stage canvas { position:absolute; inset:0; width:100%; height:100% }
   .stage .flash { position:absolute; inset:0; pointer-events:none; box-shadow: inset 0 0 0 0 var(--urgent); transition: box-shadow .15s }
-  .stage.hazard .flash { box-shadow: inset 0 0 0 10px var(--urgent) }
-  .hud { position:absolute; left:10px; bottom:10px; background:rgba(0,0,0,.55); padding:6px 10px; border-radius:8px; font-size:13px; color:var(--muted) }
+  .stage.hazard .flash { box-shadow: inset 0 0 0 18px var(--urgent) }
+  .stage .tint { position:absolute; inset:0; pointer-events:none; background:var(--urgent); opacity:0; transition: opacity .3s }
+  .stage.tinted .tint { opacity:.28; transition: opacity .05s }
+  .subtitle { position:absolute; left:0; right:0; bottom:0; padding:10px 16px; text-align:center; font-size:17px; line-height:1.3;
+              color:#fff; background:linear-gradient(transparent, rgba(0,0,0,.75) 35%); text-shadow:0 1px 3px #000; pointer-events:none; min-height:44px }
+  .subtitle:empty { display:none }
+  .hud { position:absolute; left:10px; top:10px; background:rgba(0,0,0,.55); padding:6px 10px; border-radius:8px; font-size:13px; color:var(--muted) }
   .panel { background:var(--card); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:10px; min-height:0 }
   .said { font-size:22px; min-height:60px; padding:10px 12px; border-radius:10px; background:#0f1317; border-left:4px solid var(--accent) }
   .said.warn { border-color:var(--warn) } .said.urgent { border-color:var(--urgent) }
@@ -48,7 +53,9 @@
   <div class="stage" id="stage">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
+    <div class="tint"></div>
     <div class="flash"></div>
+    <div class="subtitle" id="subtitle"></div>
     <div class="hud" id="hud">—</div>
   </div>
 
@@ -180,6 +187,15 @@ async function start() {
   ws.onclose = () => $('status').textContent = 'disconnected';
   $('start').disabled = true;
 }
+// 400 ms translucent red wash over the video on every hazard frame (re-armed while the hazard persists)
+let tintTimer = null;
+function hazardTint() {
+  $('stage').classList.add('tinted');
+  clearTimeout(tintTimer);
+  tintTimer = setTimeout(() => $('stage').classList.remove('tinted'), 400);
+}
+// latest scene caption: subtitle bar on the video + the line under "said"
+function setCaption(text) { $('subtitle').textContent = text; $('caption').textContent = text; }
 const off = document.createElement('canvas'); const octx = off.getContext('2d');
 function pump() {
   if (!ws || ws.readyState !== 1) return;
@@ -203,8 +219,9 @@ function onResult(r) {
     ctx.fillText(`${d.label} · ${d.side} · ${d.distance}${d.closing ? ' · closing' : ''}`, x1 * sx + 4, y1 * sy - 6);
   }
   $('stage').classList.toggle('hazard', r.hazard);
+  if (r.hazard) hazardTint();
   $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects`;
-  if (r.caption) $('caption').textContent = r.caption;
+  if (r.caption) setCaption(r.caption);
   if (r.say) { show(r.say.text, r.say.urgency); speak(r.say.text, r.say.side, r.say.urgency, r.say.audio_url); logItem(r.say.urgency, r.say.text); }
 }
 
@@ -223,7 +240,7 @@ $('start').onclick = () => start().catch(err => { $('status').textContent = 'cam
 setInterval(async () => {
   const s = await (await fetch('/state')).json();
   for (const item of s.log.filter(i => i.kind === 'caption').slice(-1)) {
-    if (!window._lastCap || item.t > window._lastCap) { window._lastCap = item.t; logItem('seen', item.text, item.clip_url); }
+    if (!window._lastCap || item.t > window._lastCap) { window._lastCap = item.t; setCaption(item.text); logItem('seen', item.text, item.clip_url); }
   }
 }, 2000);
 </script>
