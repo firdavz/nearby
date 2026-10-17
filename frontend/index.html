@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Second Sight</title>
+<style>
+  :root { --bg:#0b0d10; --fg:#e8eaed; --muted:#8a919a; --accent:#5ad1a3; --warn:#f2b134; --urgent:#ff5c5c; --card:#14181d; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid #222; }
+  header h1 { font-size:18px; margin:0; letter-spacing:.3px }
+  header .sp { flex:1 }
+  button, select, input { font:inherit; background:var(--card); color:var(--fg); border:1px solid #2a3038; border-radius:8px; padding:8px 12px; }
+  button.primary { background:var(--accent); color:#06231a; border-color:transparent; font-weight:600 }
+  main { display:grid; grid-template-columns: 3fr 2fr; gap:14px; padding:14px 16px; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr } }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3 }
+  .stage video, .stage canvas { position:absolute; inset:0; width:100%; height:100% }
+  .stage .flash { position:absolute; inset:0; pointer-events:none; box-shadow: inset 0 0 0 0 var(--urgent); transition: box-shadow .15s }
+  .stage.hazard .flash { box-shadow: inset 0 0 0 10px var(--urgent) }
+  .hud { position:absolute; left:10px; bottom:10px; background:rgba(0,0,0,.55); padding:6px 10px; border-radius:8px; font-size:13px; color:var(--muted) }
+  .panel { background:var(--card); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:10px; min-height:0 }
+  .said { font-size:22px; min-height:60px; padding:10px 12px; border-radius:10px; background:#0f1317; border-left:4px solid var(--accent) }
+  .said.warn { border-color:var(--warn) } .said.urgent { border-color:var(--urgent) }
+  .caption { color:var(--muted); font-size:14px }
+  .row { display:flex; gap:8px } .row input { flex:1 }
+  .log { overflow:auto; max-height:40vh; display:flex; flex-direction:column; gap:6px; font-size:14px }
+  .log .item { padding:8px 10px; border-radius:8px; background:#0f1317; display:flex; gap:8px; align-items:flex-start }
+  .log .k { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); min-width:56px; padding-top:3px }
+  .log .k.urgent{color:var(--urgent)} .log .k.warn{color:var(--warn)} .log .k.answer{color:var(--accent)}
+  .log video { width:160px; border-radius:6px; margin-left:auto }
+</style>
+</head>
+<body>
+<header>
+  <h1>👁 Second Sight</h1>
+  <span class="caption" id="status">camera off</span>
+  <span class="sp"></span>
+  <label class="caption">voice
+    <select id="persona"><option value="calm">Calm</option><option value="attenborough">Attenborough</option></select>
+  </label>
+  <button id="mute">🔊 sound on</button>
+  <button class="primary" id="start">Start camera</button>
+</header>
+
+<main>
+  <div class="stage" id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="flash"></div>
+    <div class="hud" id="hud">—</div>
+  </div>
+
+  <div class="panel">
+    <div class="said" id="said">…</div>
+    <div class="caption" id="caption">no scene description yet</div>
+    <form class="row" id="askform">
+      <input id="q" placeholder="where are my keys?  ·  what do you see?" autocomplete="off">
+      <button class="primary">Ask</button>
+    </form>
+    <div class="log" id="log"></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
+let ws, sending = false, muted = false;
+
+// ---------- audio: panned earcon + speech -------------------------------------------
+// Browser speechSynthesis can't be routed through Web Audio, so direction comes from a short
+// panned tone played just before the sentence; the voice itself is centre. Good enough, and instant.
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+function earcon(side, urgency) {
+  if (muted) return;
+  const o = AC.createOscillator(), g = AC.createGain(), p = AC.createStereoPanner();
+  p.pan.value = side === 'left' ? -1 : side === 'right' ? 1 : 0;
+  o.frequency.value = urgency === 'urgent' ? 880 : 520;
+  o.type = urgency === 'urgent' ? 'square' : 'sine';
+  g.gain.setValueAtTime(0.0001, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.4, AC.currentTime + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + (urgency === 'urgent' ? 0.25 : 0.12));
+  o.connect(g).connect(p).connect(AC.destination); o.start(); o.stop(AC.currentTime + 0.3);
+}
+function speak(text, side, urgency) {
+  if (!text) return;
+  earcon(side, urgency);
+  if (muted) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = urgency === 'urgent' ? 1.25 : 1.0;
+  if ($('persona').value === 'attenborough') { u.rate = 0.9; u.pitch = 0.8; }
+  if (urgency === 'urgent') speechSynthesis.cancel();   // never queue behind chatter
+  speechSynthesis.speak(u);
+}
+function show(text, urgency) { const s = $('said'); s.textContent = text; s.className = 'said ' + (urgency || ''); }
+function logItem(kind, text, clip) {
+  const d = document.createElement('div'); d.className = 'item';
+  d.innerHTML = `<span class="k ${kind}">${kind}</span><span>${text}</span>` + (clip ? `<video src="${clip}" controls muted></video>` : '');
+  $('log').prepend(d);
+}
+
+// ---------- camera → websocket -----------------------------------------------------
+async function start() {
+  await AC.resume();
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 640 } }, audio: false });
+  video.srcObject = stream; await video.play();
+  overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/frames`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('status').textContent = 'live'; pump(); };
+  ws.onmessage = e => onResult(JSON.parse(e.data));
+  ws.onclose = () => $('status').textContent = 'disconnected';
+  $('start').disabled = true;
+}
+const off = document.createElement('canvas'); const octx = off.getContext('2d');
+function pump() {
+  if (!ws || ws.readyState !== 1) return;
+  if (!sending) {
+    sending = true;
+    off.width = 640; off.height = Math.round(640 * video.videoHeight / video.videoWidth) || 480;
+    octx.drawImage(video, 0, 0, off.width, off.height);
+    off.toBlob(b => b.arrayBuffer().then(buf => { ws.send(buf); }), 'image/jpeg', 0.6);
+  }
+  setTimeout(pump, 100);   // ~10 fps upstream; backend sets the real pace
+}
+function onResult(r) {
+  sending = false;
+  const sx = overlay.width / 640, sy = overlay.height / (off.height || 480);
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  for (const d of r.detections) {
+    const [x1, y1, x2, y2] = d.box; const haz = d.closing && d.distance === 'near';
+    ctx.lineWidth = haz ? 4 : 2; ctx.strokeStyle = haz ? '#ff5c5c' : d.distance === 'near' ? '#f2b134' : '#5ad1a3';
+    ctx.strokeRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
+    ctx.fillStyle = ctx.strokeStyle; ctx.font = '14px system-ui';
+    ctx.fillText(`${d.label} · ${d.side} · ${d.distance}${d.closing ? ' · closing' : ''}`, x1 * sx + 4, y1 * sy - 6);
+  }
+  $('stage').classList.toggle('hazard', r.hazard);
+  $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects`;
+  if (r.caption) $('caption').textContent = r.caption;
+  if (r.say) { show(r.say.text, r.say.urgency); speak(r.say.text, r.say.side, r.say.urgency); logItem(r.say.urgency, r.say.text); }
+}
+
+// ---------- ask, persona, mute -------------------------------------------------------
+$('askform').onsubmit = async e => {
+  e.preventDefault(); const q = $('q').value.trim(); if (!q) return; $('q').value = '';
+  logItem('you', q);
+  const a = await (await fetch('/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }) })).json();
+  show(a.text, 'info'); speak(a.text, null, 'info'); logItem('answer', a.text, a.clip_url);
+};
+$('persona').onchange = e => fetch('/persona', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ persona: e.target.value }) });
+$('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇 muted' : '🔊 sound on'; if (muted) speechSynthesis.cancel(); };
+$('start').onclick = () => start().catch(err => { $('status').textContent = 'camera error: ' + err.message; });
+
+// pull captions written by the slow path even when nothing new is said
+setInterval(async () => {
+  const s = await (await fetch('/state')).json();
+  for (const item of s.log.filter(i => i.kind === 'caption').slice(-1)) {
+    if (!window._lastCap || item.t > window._lastCap) { window._lastCap = item.t; logItem('seen', item.text, item.clip_url); }
+  }
+}, 2000);
+</script>
+</body>
+</html>

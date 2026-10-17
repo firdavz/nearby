@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+numpy
+opencv-python-headless
+openai>=1.40
+boto3
+weave
+wandb
+ultralytics      # only needed with USE_REAL_YOLO=1
