@@ -126,11 +126,9 @@ else:
            voice._off["why"] or "check ELEVENLABS_API_KEY / credits")
 
 # ---------------------------------------------------------------- demo clips
-print("\nDemo clips")
+print("\nDemo clips (optional: the demo is live)")
 clips = sorted((ROOT / "data/demo").glob("*.mp4"))
-report("OK" if clips else "FAIL", f"data/demo/*.mp4: {', '.join(c.name for c in clips) or 'none'}",
-       "film walk.mp4 (someone walks toward you) and cup.mp4 (put a cup down, walk away) at eye level; "
-       "data/ is not in git, copy them onto this machine")
+report("OK", f"data/demo/*.mp4: {', '.join(c.name for c in clips) or 'none, live camera only'}")
 
 print(f"\n{'READY' if not fails else f'{fails} FAIL'}, {warns} WARN")
 sys.exit(1 if fails else 0)
