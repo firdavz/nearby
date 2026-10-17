@@ -138,12 +138,12 @@ def caption_fake(clip_path: str) -> str:
 
 
 # --------------------------------------------------------------------------- REAL
-PROMPT = ("You are the eyes of a person with sight loss. Describe this short clip in one or two plain sentences: "
-          "the main objects and where they are (left/right/ahead, near/far), any people and what they are doing, "
-          "and anything that could be a hazard. Name small personal items explicitly if visible "
-          "(keys, phone, wallet, glasses, cup, bag). Finish with one short sentence starting 'Path ahead:' — "
-          "say whether the way forward is clear or busy, and if busy, which side is clearer. "
-          "Answer directly, no preamble, no reasoning steps.")
+PROMPT = ("You are the eyes of a person with sight loss who is walking. Reply with ONE sentence of at most 15 words "
+          "naming only the objects within about two metres of the camera, nearest first, each with its side "
+          "(left, right or ahead). Ignore the background, walls, floor, far objects and decor. "
+          "If nothing is close, reply exactly: Clear ahead. "
+          "Only if something is in the way, add a second short sentence starting 'Path ahead:' saying which side is clearer. "
+          "No preamble, no lists, no reasoning steps.")
 
 
 def _clean(text: str) -> str:
@@ -250,18 +250,21 @@ def caption_openai(clip_path: str) -> str:
 # ---- mode: yolo (no Cosmos at all) ------------------------------------------------
 def caption_from_detections(dets: list[dict]) -> str:
     """Template caption from the YOLO detections seen during the clip — no model call.
-    dets: list of {label, side, distance} (one per detection per frame)."""
-    if not dets:
-        return "Nothing recognised in view."
+    dets: list of {label, side, distance} (one per detection per frame). Only near/mid objects count,
+    at most three, most frequent first; nothing close → "Clear ahead." """
+    close = [d for d in dets if d.get("distance") in ("near", "mid")]
+    if not close:
+        return "Clear ahead."
     from collections import Counter
-    seen: Counter = Counter((d["label"], d["side"], d["distance"]) for d in dets)
+    seen: Counter = Counter((d["label"], d["side"], d["distance"]) for d in close)
     # keep the most frequent placement per label, most common labels first
     best: dict[str, tuple[str, str, int]] = {}
     for (label, side, dist), n in seen.items():
         if label not in best or n > best[label][2]:
             best[label] = (side, dist, n)
-    order = sorted(best.items(), key=lambda kv: -kv[1][2])[:5]
-    where = {"left": "on your left", "right": "on your right", "centre": "ahead of you"}
+    rank = {"near": 0, "mid": 1}
+    order = sorted(best.items(), key=lambda kv: (rank[kv[1][1]], -kv[1][2]))[:3]   # nearest first
+    where = {"left": "on your left", "right": "on your right", "centre": "ahead"}
     parts = []
     for label, (side, dist, _) in order:
         article = "a person" if label == "person" else f"a {label}"

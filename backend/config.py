@@ -75,3 +75,6 @@ if WANDB_PROJECT and "/" not in WANDB_PROJECT and WANDB_TEAM:
 # YOLO closing (owner B): box area now vs this many seconds ago. Replaces SMOOTH_FRAMES, which meant a
 # different time at every frame rate (5 fps through the tunnel vs 30 locally).
 CLOSING_WINDOW_S = float(os.getenv("CLOSING_WINDOW_S", "0.6"))
+
+# Captions are one short sentence about what's near (slow_loop.PROMPT); 60 tokens is plenty and stops rambling.
+COSMOS_MAX_TOKENS = int(os.getenv("COSMOS_MAX_TOKENS", "60"))

@@ -180,7 +180,9 @@ def process_frame(frame: np.ndarray, s: SessionState, dropped: int = 0) -> dict:
     # ---- fast path --------------------------------------------------------------
     dets = fast_loop.detect(frame)
     s.seen_labels.update(d["label"] for d in dets)
-    s.clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets)
+    # near/mid only: the template caption and the stored objects shouldn't be padded with distant things
+    # (seen_labels keeps everything, so last_seen() still finds a far cup)
+    s.clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets if d["distance"] != "far")
     H, W = frame.shape[:2]
     if nav.active:
         # guide mode: steering cues, else urgent hazards, else a reasoned phrase at most every 6 s.
