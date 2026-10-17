@@ -154,6 +154,31 @@ def real_embed(text: str, kind: str = "passage") -> np.ndarray:
     return embed(text, kind)
 
 
+KEYWORD_BOOST = 0.06
+STOPWORDS = {"a", "an", "the", "i", "my", "me", "is", "are", "was", "were", "did", "do", "does", "where", "what",
+             "who", "when", "how", "there", "anything", "something", "someone", "in", "on", "at", "to", "of", "it",
+             "you", "your", "see", "saw", "last", "put", "leave", "left", "doing", "any", "have", "has"}
+# Words a blind user would say -> words Cosmos captions and YOLO labels tend to use
+SYNONYMS = {
+    "way": {"walkway", "path", "blocking", "middle"}, "path": {"walkway", "way", "blocking"},
+    "drink": {"cup", "mug", "bottle", "glass"}, "cup": {"mug"}, "mug": {"cup"},
+    "bag": {"backpack", "handbag", "suitcase"}, "phone": {"smartphone", "cell"},
+    "sofa": {"couch"}, "couch": {"sofa"}, "tv": {"television", "remote"},
+    "came": {"enters", "walks", "opens", "door"}, "come": {"enters", "walks", "opens", "door"},
+}
+
+
+def _query_concepts(text: str) -> list[set[str]]:
+    """One set per meaningful query word: the word plus its synonyms. Each set counts once."""
+    words = {w.rstrip("s") if len(w) > 3 else w for w in re.findall(r"[a-z0-9]+", text.lower())} - STOPWORDS
+    return [{w} | SYNONYMS.get(w, set()) for w in words]
+
+
+def _clip_words(caption: str, objects_json: str) -> set[str]:
+    text = caption + " " + " ".join(json.loads(objects_json))
+    return {w.rstrip("s") if len(w) > 3 else w for w in re.findall(r"[a-z0-9]+", text.lower())}
+
+
 VDB_SCHEMA = "second_sight"   # our own schema in the team's VastDB bucket, next to vss-schema
 VDB_TABLE = "clips"
 EMB_DIM = 256                 # Cosmos Embed1, same as VAST's own vss-collection vectors
@@ -278,6 +303,8 @@ class RealMemory:
             return self.con.execute(sql).fetchall()
 
     def search(self, query: str) -> list[MemoryHit]:
+        """Hybrid search: Cosmos Embed1 similarity plus a small boost per exact word match
+        (with everyday synonyms), so "at my desk" or "in my way" don't lose to vaguer clips."""
         q = real_embed(query, "query")
         # Only compare vectors from the same model (the local fallback has a different size).
         rows = [r for r in self._rows("SELECT t, caption, objects, key, emb FROM clips")
@@ -285,7 +312,10 @@ class RealMemory:
         if not rows:
             return []
         M = np.stack([np.frombuffer(r[4], dtype=np.float32) for r in rows])
-        scores = M @ q
+        concepts = _query_concepts(query)
+        boost = np.array([KEYWORD_BOOST * min(3, sum(bool(c & cw) for c in concepts))
+                          for cw in (_clip_words(r[1], r[2]) for r in rows)])
+        scores = M @ q + boost
         top = np.argsort(-scores)[:5]
         return [{"t": rows[i][0], "caption": rows[i][1], "clip_url": self._url(rows[i][3])} for i in top if scores[i] > 0]
 
