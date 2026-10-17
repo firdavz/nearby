@@ -188,6 +188,14 @@ def agent_ask_fake(question: str) -> AgentAnswer:
 # "a living room") — unacceptable for a blind user. One call instead of two is also faster.
 _client = None
 _weave = False
+
+
+def wandb_project() -> str:
+    """entity/project for W&B, or "" for the key's default. The .env.example placeholder
+    ("team/second-sight") makes W&B reject the key with 401 and the agent silently falls back to
+    rules, so a placeholder or malformed value counts as unset."""
+    p = (config.WANDB_PROJECT or "").strip()
+    return "" if (not p or p.startswith("team/") or p.count("/") != 1) else p
 _llm_lock = threading.Lock()
 _lookup = None   # memory_lookup, wrapped as a Weave op once Weave is up so lookups show in the trace
 
@@ -201,11 +209,12 @@ def _llm_init():
     global _client, _weave, _lookup
     if _client is None:
         from openai import OpenAI
-        _client = OpenAI(base_url=config.WANDB_BASE_URL, api_key=config.WANDB_API_KEY or "none",
-                         default_headers={"OpenAI-Project": config.WANDB_PROJECT} if config.WANDB_PROJECT else None)
+        project = wandb_project()
+        _client = OpenAI(base_url=config.WANDB_BASE_URL, api_key=(config.WANDB_API_KEY or "none").strip(),
+                         default_headers={"OpenAI-Project": project} if project else None)
         try:
             import weave
-            weave.init(config.WANDB_PROJECT or "second-sight"); _weave = True
+            weave.init(project or "second-sight"); _weave = True
             _lookup = weave.op(memory_lookup)
         except Exception:
             pass
