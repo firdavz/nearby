@@ -54,9 +54,29 @@ def _said(text: str) -> None:
     _last_spoke, _last_text = time.time(), text
 
 
+_ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split()
+_TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty"}
+
+
+def _words(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    tens, ones = divmod(n, 10)
+    return _TENS[tens] + (f"-{_ONES[ones]}" if ones else "")
+
+
 def _fmt_t(t: float) -> str:
-    ago = int(time.time() - t)
-    return f"{ago} seconds ago" if ago < 90 else f"{ago // 60} minutes ago"
+    """Plain-spoken 'how long ago': 40 s -> 'about a minute ago', 7 min -> 'seven minutes ago'."""
+    ago = max(0, int(time.time() - t))
+    if ago < 20:
+        return "just now"
+    if ago < 90:
+        return "about a minute ago"
+    mins = round(ago / 60)
+    if mins < 60:
+        return f"{_words(mins)} minutes ago"
+    hours = round(mins / 60)
+    return "about an hour ago" if hours == 1 else f"about {_words(min(hours, 59))} hours ago"
 
 
 # --------------------------------------------------------------------------- FAKE
@@ -119,11 +139,16 @@ def _llm():
     return _client
 
 
+def _with_ago(hit):
+    """Give the model a ready-made 'ago' phrase so it never does time maths."""
+    return {**hit, "ago": _fmt_t(hit["t"])} if hit else hit
+
+
 def _call_tool(name: str, args: dict):
     if name == "search_memory":
-        return memory.search(args["query"])
+        return [_with_ago(h) for h in memory.search(args["query"])]
     if name == "last_seen":
-        return memory.last_seen(args["label"])
+        return _with_ago(memory.last_seen(args["label"]))
     if name == "describe_now":
         return {"caption": _latest_caption}
     return {"error": "unknown tool"}
@@ -172,7 +197,7 @@ def agent_on_events_real(events: list[Detection], caption: str) -> AgentLine | N
 
 def agent_ask_real(question: str) -> AgentAnswer:
     sysmsg = PERSONAS.get(config.PERSONA, PERSONAS["calm"]) + (
-        " Answer questions about what the camera has seen using the tools. Say how long ago in plain words. "
+        " Answer questions about what the camera has seen using the tools. Say how long ago using the tool's 'ago' field as written. "
         "If you don't know, say so in one sentence.")
     text, clip = _run([{"role": "system", "content": sysmsg}, {"role": "user", "content": question}])
     return {"text": text, "clip_url": clip}
