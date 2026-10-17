@@ -39,26 +39,44 @@ def _system(task: str) -> str:
 _last_spoke = 0.0
 _last_text = ""
 _latest_caption = ""
-_last_hazard = {"t": 0.0, "text": "", "seen": 0.0}
+_quiet_until = 0.0      # no chatter before this (set around a user question)
 HAZARD_REPEAT_S = 8.0   # the same danger, still there, is repeated at most this often
 HAZARD_GONE_S = 2.0     # if a danger vanishes for this long and comes back, warn again at once
+HAZARD_MIN_GAP_S = 2.5  # never two warnings closer than this, whatever they are
+ANSWER_QUIET_S = 8.0    # chatter holds off this long around a question, so the answer stands alone
+NOVELTY_S = 45.0        # chatter won't mention the same kind of object again within this window
+
+# Priority among dangers seen at once: fast movers, then bikes, then people/animals, then obstacles;
+# in your path (centre) before off to the side; the bigger (closer) box first.
+_DANGER_CLASS = {"car": 0, "bus": 0, "truck": 0, "motorcycle": 0, "bicycle": 1, "person": 2, "dog": 2}
+_hazards: dict[str, dict] = {}            # per object: when it was last seen as a hazard / last warned
+_last_warning = 0.0
+
+
+def _danger_rank(d: Detection) -> tuple:
+    x1, y1, x2, y2 = d["box"]
+    return (_DANGER_CLASS.get(d["label"], 3), 0 if d["side"] == "centre" else 1, -(x2 - x1) * (y2 - y1))
 
 
 def _hazard_line(events: list[Detection]) -> AgentLine | None:
-    """Fast path. Bypasses the chatter cooldown but warns once per danger, not every frame:
-    a continuous warning drowned out everything else, including answers to questions."""
-    hazards = [e for e in events if is_hazard(e)]
-    if not hazards:
-        return None
-    line = fixed_alert(hazards[0])
-    line["text"] = voice.hazard_phrase(hazards[0]["label"], hazards[0]["side"])  # human wording, still no model
+    """Fast path, no model. Picks the single most important danger and warns once per object,
+    not every frame: continuous warnings drowned out everything else, including answers."""
+    global _last_warning
     now = time.time()
-    same = line["text"] == _last_hazard["text"]
-    continuous = now - _last_hazard["seen"] < HAZARD_GONE_S
-    _last_hazard["seen"] = now
-    if same and continuous and now - _last_hazard["t"] < HAZARD_REPEAT_S:
+    due = []
+    for d in sorted((e for e in events if is_hazard(e)), key=_danger_rank):
+        key = f"{d['label']}:{d['track_id']}" if d["track_id"] >= 0 else d["label"]
+        h = _hazards.setdefault(key, {"warned": 0.0, "seen": 0.0})
+        returning = now - h["seen"] > HAZARD_GONE_S
+        h["seen"] = now
+        if returning or now - h["warned"] > HAZARD_REPEAT_S:
+            due.append((d, h))
+    if not due or now - _last_warning < HAZARD_MIN_GAP_S:
         return None
-    _last_hazard.update(t=now, text=line["text"])
+    d, h = due[0]
+    h["warned"] = _last_warning = now
+    line = fixed_alert(d)
+    line["text"] = voice.hazard_phrase(d["label"], d["side"])  # human wording, still no model
     _said(line["text"])
     return line
 
@@ -69,7 +87,22 @@ def set_latest_caption(c: str) -> None:
 
 
 def _rate_ok() -> bool:
-    return time.time() - _last_spoke > config.SPEAK_COOLDOWN_S
+    """May the agent chatter now? Not during the cooldown, and not around a user question."""
+    now = time.time()
+    return now - _last_spoke > config.SPEAK_COOLDOWN_S and now >= _quiet_until
+
+
+def _hold_chatter(seconds: float) -> None:
+    global _quiet_until
+    _quiet_until = max(_quiet_until, time.time() + seconds)
+    _pending["line"] = None   # anything queued before the question is stale now
+
+
+_announced: dict[str, float] = {}   # object label -> when chatter last mentioned it
+
+
+def _is_new(label: str) -> bool:
+    return time.time() - _announced.get(label, 0.0) > NOVELTY_S
 
 
 def _said(text: str) -> None:
@@ -109,12 +142,13 @@ def agent_on_events_fake(events: list[Detection], caption: str) -> AgentLine | N
         return line
     if not _rate_ok():
         return None
-    near = [e for e in events if e["distance"] == "near"]
+    near = [e for e in events if e["distance"] == "near" and _is_new(e["label"])]
     if near:
         e = near[0]
         text = f"{e['label']} close on your {e['side']}." if e["side"] != "centre" else f"{e['label']} directly ahead."
         if text != _last_text:
-            _said(text); return {"text": text, "side": e["side"], "urgency": "warn"}
+            _said(text); _announced[e["label"]] = time.time()
+            return {"text": text, "side": e["side"], "urgency": "warn"}
     return None
 
 
@@ -243,9 +277,17 @@ def _think(events: list[Detection], caption: str) -> None:
         _thinking["busy"] = False
 
 
+_last_decided_caption = ""
+
+
 def _decide(events: list[Detection], caption: str) -> AgentLine | None:
-    near = [e for e in events if e["distance"] != "far"]
-    if not near and not caption:
+    global _last_decided_caption
+    # Only things not mentioned recently; and if nothing is new and the scene hasn't changed,
+    # there is nothing to say — skip the model call entirely.
+    near = [e for e in events if e["distance"] != "far" and _is_new(e["label"])]
+    scene_changed = bool(caption) and caption != _last_decided_caption
+    _last_decided_caption = caption
+    if not near and not scene_changed:
         return None
     sysmsg = _system(
         "Decide if the person needs to hear anything right now.\n"
@@ -264,6 +306,8 @@ def _decide(events: list[Detection], caption: str) -> AgentLine | None:
     if not text or text.upper().startswith("SILENT") or text == _last_text:
         return None
     side = near[0]["side"] if near else None
+    for e in near:
+        _announced[e["label"]] = time.time()
     return {"text": text, "side": side, "urgency": "info"}
 
 
@@ -301,8 +345,13 @@ def agent_on_events(events: list[Detection], caption: str) -> AgentLine | None:
 
 
 def agent_ask(question: str) -> AgentAnswer:
+    """The user's question outranks chatter: it's held off while we answer and for a while after."""
+    _hold_chatter(ANSWER_QUIET_S)
     ans = _ask(question)
     ans["audio_url"] = voice.tts(ans["text"], config.PERSONA)
+    _hold_chatter(ANSWER_QUIET_S)
+    global _last_text
+    _last_text = ans["text"]   # so chatter won't echo the answer
     return ans
 
 

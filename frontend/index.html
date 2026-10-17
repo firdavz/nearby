@@ -46,6 +46,10 @@
     <select id="persona"><option value="calm">Calm</option><option value="attenborough">Attenborough</option></select>
   </label>
   <button id="mute">🔊 sound on</button>
+  <button id="usevideo" title="Play a first-person video as the person's eyes">🎞 Use video</button>
+  <input type="file" id="vfile" accept="video/*" hidden>
+  <button id="pausebtn" hidden>⏸ Pause</button>
+  <button id="stopbtn" hidden>⏹ Stop</button>
   <button class="primary" id="start">Start camera</button>
 </header>
 
@@ -125,46 +129,88 @@ function earcon(side, urgency) {
   return dur * 1000;
 }
 
-// ElevenLabs lines arrive as an audio_url; played through Web Audio so the VOICE itself is panned.
+// ---------- speech manager: ONE voice at a time, decided by priority ------------------
+//   3 answer — reply to the user's own question. Top: nothing interrupts it.
+//   2 urgent — hazard. Cuts into warn/info. During an answer (or while waiting for one) it plays
+//              only its panned tone at once, and its words right after the answer.
+//   1 warn   — something close.
+//   0 info   — chatter / scene descriptions. Only into silence; never queued.
+// Before this, each line decided for itself and warnings, chatter and answers overlapped.
+const PRIO = { answer: 3, urgent: 2, warn: 1, info: 0 };
+const HELD_MAX_AGE_MS = 6000;          // a held hazard older than this is stale; a fresh one will come
+const CHATTER_AFTER_URGENT_MS = 2000;  // a breath after a warning before any chatter
 const audioCache = new Map();          // url -> decoded buffer (hazard lines repeat, so replays are instant)
 let current = null;                    // the natural-voice clip playing now
-function stopAll() { speechSynthesis.cancel(); if (current) { try { current.stop(); } catch (e) {} current = null; } }
-function busy() { return !!current || speechSynthesis.speaking; }
-async function playNatural(url, side) {
+let playing = null;                    // { prio } of the line being spoken (tone included), else null
+let playId = 0;                        // bumped on every cut; callbacks from a cut line are ignored
+let awaitingAnswer = false;            // user asked; answer not back yet
+let held = null;                       // { item, t }: hazard waiting for the answer to finish
+let lastUrgentAt = 0;
+
+function silence() { playId++; playing = null; speechSynthesis.cancel(); if (current) { try { current.stop(); } catch (e) {} current = null; } }
+function stopAll() { silence(); held = null; }
+
+// ElevenLabs lines arrive as an audio_url; played through Web Audio so the VOICE itself is panned.
+async function playNatural(url, side, id, onEnd) {
   let buf = audioCache.get(url);
   if (!buf) { buf = await AC.decodeAudioData(await (await fetch(url)).arrayBuffer()); audioCache.set(url, buf); }
+  if (id !== playId) return;                                             // cut while we were loading
   const src = AC.createBufferSource(); src.buffer = buf;
   const p = AC.createStereoPanner(); p.pan.value = side === 'left' ? -0.7 : side === 'right' ? 0.7 : 0;
   src.connect(p).connect(AC.destination);
-  src.onended = () => { if (current === src) current = null; };
+  src.onended = () => { if (current === src) current = null; onEnd(); };
   current = src; src.start();
 }
-function speakBrowser(text, urgent) {
+function speakBrowser(text, urgent, onEnd) {
   const persona = $('persona').value;                                    // read now, so the toggle is live
   const u = new SpeechSynthesisUtterance(text);
   const v = pickVoice(persona); if (v) { u.voice = v; u.lang = v.lang; }
   const st = VOICE_STYLE[persona] || VOICE_STYLE.calm;
   u.rate = urgent ? 1.2 : st.rate; u.pitch = urgent ? 1.0 : st.pitch;
+  u.onend = u.onerror = onEnd;
   speechSynthesis.speak(u);
 }
 
-let lastUrgentAt = 0;
-function speak(text, side, urgency, audioUrl) {
-  if (!text) return;
-  const urgent = urgency === 'urgent';
-  const answer = urgency === 'answer';                                   // reply to the user's own question
-  if (urgent || answer) stopAll();                                       // hazards and answers cut in
-  else if (busy() || Date.now() - lastUrgentAt < 1500) return;           // chatter never talks over anything
-  if (urgent) lastUrgentAt = Date.now();
-  const toneMs = earcon(side, urgency);
-  if (muted) return;
-  const queuedAt = Date.now();
+function finished(id) { if (id === playId) { playing = null; flushHeld(); } }
+function flushHeld() {
+  if (!held || awaitingAnswer || playing || muted) return;
+  const h = held; held = null;
+  if (Date.now() - h.t < HELD_MAX_AGE_MS) play(h.item);
+}
+function play(item) {
+  silence();
+  const id = playId;
+  playing = { prio: PRIO[item.urgency] ?? 0 };
+  if (item.urgency === 'urgent') lastUrgentAt = Date.now();
+  show(item.text, item.urgency === 'answer' ? 'info' : item.urgency);
+  if (item.urgency !== 'answer') logItem(item.urgency, item.text);     // the log shows what was actually said
+  const toneMs = earcon(item.side, item.urgency);
+  // Chrome sometimes never fires onend; without this a stuck line would block everything below it.
+  setTimeout(() => finished(id), toneMs + 2500 + 110 * item.text.length);
   setTimeout(async () => {                                               // tone first, then the voice
-    if (urgent) stopAll();                                               // catch chatter that started meanwhile
-    else if (!answer && lastUrgentAt > queuedAt) return;                 // a hazard arrived while we waited
-    if (audioUrl) { try { await playNatural(audioUrl, side); return; } catch (e) { console.warn('natural voice failed', e); } }
-    speakBrowser(text, urgent);                                          // no key / offline → browser voice
+    if (id !== playId) return;
+    if (item.audioUrl) {
+      try { await playNatural(item.audioUrl, item.side, id, () => finished(id)); return; }
+      catch (e) { console.warn('natural voice failed', e); }
+    }
+    if (id === playId) speakBrowser(item.text, item.urgency === 'urgent', () => finished(id));  // no key / offline
   }, toneMs + 20);
+}
+
+// The one entry point. Returns true if the line will be spoken now.
+function speak(text, side, urgency, audioUrl) {
+  if (!text || muted) return false;
+  const item = { text, side, urgency, audioUrl };
+  const p = PRIO[urgency] ?? 0;
+  if (urgency !== 'answer' && (awaitingAnswer || playing?.prio === PRIO.answer)) {
+    if (urgency === 'urgent') { earcon(side, 'urgent'); held = { item, t: Date.now() }; }  // beep now, words after
+    return false;                                                        // chatter during a question: dropped
+  }
+  if (playing && p < playing.prio) return false;                        // never talk over something more important
+  if (playing && p === playing.prio && p < PRIO.urgent) return false;   // same-level chatter: let it finish
+  if (p < PRIO.urgent && Date.now() - lastUrgentAt < CHATTER_AFTER_URGENT_MS) return false;
+  play(item);                                                            // more important (or a newer hazard): take over
+  return true;
 }
 function show(text, urgency) { const s = $('said'); s.textContent = text; s.className = 'said ' + (urgency || ''); }
 function logItem(kind, text, clip) {
@@ -174,18 +220,45 @@ function logItem(kind, text, clip) {
 }
 
 // ---------- camera → websocket -----------------------------------------------------
-async function start() {
+// videoUrl given → a first-person video plays as the person's eyes (looped); else the live camera.
+// Everything downstream (frames → detect → speech, memory, ask) is identical either way.
+async function start(videoUrl) {
   await AC.resume();
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 640 } }, audio: false });
-  video.srcObject = stream; await video.play();
+  if (videoUrl) {
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());   // switching off the webcam
+    video.srcObject = null; video.src = videoUrl; video.loop = true; video.muted = true;
+  } else {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 640 } }, audio: false });
+    video.srcObject = stream;
+  }
+  await video.play();
   overlay.width = video.videoWidth; overlay.height = video.videoHeight;
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/frames`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { $('status').textContent = 'live'; pump(); };
-  ws.onmessage = e => onResult(JSON.parse(e.data));
-  ws.onclose = () => $('status').textContent = 'disconnected';
+  if (!ws || ws.readyState > 1) {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws/frames`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => pump();
+    ws.onmessage = e => onResult(JSON.parse(e.data));
+    ws.onclose = () => $('status').textContent = 'disconnected';
+  }
+  $('status').textContent = videoUrl ? 'live · video as eyes' : 'live · camera';
   $('start').disabled = true;
+  $('pausebtn').hidden = $('stopbtn').hidden = false; $('pausebtn').textContent = '⏸ Pause';
+}
+// Pause freezes the feed: no frames are sent, so nothing new is detected or said. Stop ends the session.
+function togglePause() {
+  if (video.paused) { video.play(); $('pausebtn').textContent = '⏸ Pause'; $('status').textContent = 'live'; }
+  else { video.pause(); stopAll(); $('pausebtn').textContent = '▶ Resume'; $('status').textContent = 'paused'; }
+}
+function stopSession() {
+  video.pause();
+  if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+  video.removeAttribute('src'); video.load();
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  sending = false; stopAll();
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  $('pausebtn').hidden = $('stopbtn').hidden = true;
+  $('start').disabled = false; $('status').textContent = 'stopped';
 }
 // 400 ms translucent red wash over the video on every hazard frame (re-armed while the hazard persists)
 let tintTimer = null;
@@ -199,7 +272,7 @@ function setCaption(text) { $('subtitle').textContent = text; $('caption').textC
 const off = document.createElement('canvas'); const octx = off.getContext('2d');
 function pump() {
   if (!ws || ws.readyState !== 1) return;
-  if (!sending) {
+  if (!sending && !video.paused) {
     sending = true;
     off.width = 640; off.height = Math.round(640 * video.videoHeight / video.videoWidth) || 480;
     octx.drawImage(video, 0, 0, off.width, off.height);
@@ -222,19 +295,38 @@ function onResult(r) {
   if (r.hazard) hazardTint();
   $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects`;
   if (r.caption) setCaption(r.caption);
-  if (r.say) { show(r.say.text, r.say.urgency); speak(r.say.text, r.say.side, r.say.urgency, r.say.audio_url); logItem(r.say.urgency, r.say.text); }
+  if (r.say) speak(r.say.text, r.say.side, r.say.urgency, r.say.audio_url);   // the speech manager shows + logs what it says
 }
 
 // ---------- ask, persona, mute -------------------------------------------------------
 $('askform').onsubmit = async e => {
   e.preventDefault(); const q = $('q').value.trim(); if (!q) return; $('q').value = '';
   logItem('you', q);
-  const a = await (await fetch('/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }) })).json();
-  show(a.text, 'info'); speak(a.text, null, 'answer', a.audio_url); logItem('answer', a.text, a.clip_url);
+  // The question takes the floor: chatter stops now; a hazard already being spoken may finish its sentence.
+  awaitingAnswer = true;
+  if (playing && playing.prio < PRIO.urgent) silence();
+  show('Looking…', 'info');
+  let a;
+  try {
+    a = await (await fetch('/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }) })).json();
+  } catch (err) {
+    a = { text: "Sorry, I couldn't reach the assistant.", clip_url: null };
+  } finally {
+    awaitingAnswer = false;
+  }
+  show(a.text, 'info'); logItem('answer', a.text, a.clip_url);
+  if (!speak(a.text, null, 'answer', a.audio_url)) flushHeld();         // muted → still release any held hazard
 };
 $('persona').onchange = e => fetch('/persona', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ persona: e.target.value }) });
 $('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇 muted' : '🔊 sound on'; if (muted) stopAll(); };
 $('start').onclick = () => start().catch(err => { $('status').textContent = 'camera error: ' + err.message; });
+// "Use video": pick a first-person clip from disk; or open the page with ?video=/clips/name.mp4
+$('usevideo').onclick = () => $('vfile').click();
+$('pausebtn').onclick = togglePause;
+$('stopbtn').onclick = stopSession;
+$('vfile').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) start(URL.createObjectURL(f)).catch(err => { $('status').textContent = 'video error: ' + err.message; }); };
+const qVideo = new URLSearchParams(location.search).get('video');
+if (qVideo) { $('status').textContent = 'click anywhere to start the video'; document.addEventListener('click', () => start(qVideo).catch(err => { $('status').textContent = 'video error: ' + err.message; }), { once: true }); }
 
 // pull captions written by the slow path even when nothing new is said
 setInterval(async () => {
