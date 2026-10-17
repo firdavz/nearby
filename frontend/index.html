@@ -63,8 +63,10 @@
   @keyframes shine { to { transform:translateX(120%) } }
 
   main { display:grid; grid-template-columns: 3fr 2fr; gap:24px; padding:24px; max-width:1440px; margin:0 auto }
-  @media (max-width: 900px) { main { grid-template-columns:1fr; gap:16px; padding:16px } header { padding:14px 16px }
+  @media (max-width: 900px) { main { gap:16px; padding:16px } header { padding:14px 16px }
     header .sp { display:none } header .group { flex:1 1 auto } }
+  /* keep video and log side by side on half-screen laptop windows; stack only on phones */
+  @media (max-width: 600px) { main { grid-template-columns:1fr } }
   /* phones: each tray is a 2-column grid of equal buttons; the voice picker spans the top row */
   @media (max-width: 600px) {
     header .group { flex-basis:100%; display:grid; grid-template-columns:1fr 1fr }
