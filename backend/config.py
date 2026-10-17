@@ -27,10 +27,17 @@ MID_FRAC = float(os.getenv("MID_FRAC", "0.22"))
 CLOSING_GROWTH = float(os.getenv("CLOSING_GROWTH", "1.15"))  # box area ratio over window → closing
 SMOOTH_FRAMES = int(os.getenv("SMOOTH_FRAMES", "5"))
 
-# Cosmos (OpenAI-compatible NIM)
-COSMOS_BASE_URL = os.getenv("COSMOS_BASE_URL", "https://integrate.api.nvidia.com/v1")
+# Cosmos Reason. COSMOS_MODE=nvcf → NVIDIA hosted API (build.nvidia.com, needs only an nvapi- key)
+#                COSMOS_MODE=openai → self-hosted NIM/vLLM, OpenAI-compatible at COSMOS_BASE_URL
+#                COSMOS_MODE=yolo   → no Cosmos: captions are templates built from YOLO detections
+COSMOS_MODE = os.getenv("COSMOS_MODE", "nvcf")
 COSMOS_API_KEY = os.getenv("COSMOS_API_KEY") or os.getenv("NVIDIA_API_KEY", "")
 COSMOS_MODEL = os.getenv("COSMOS_MODEL", "nvidia/cosmos-reason1-7b")
+COSMOS_INVOKE_URL = os.getenv("COSMOS_INVOKE_URL") or f"https://ai.api.nvidia.com/v1/vlm/{COSMOS_MODEL}"
+COSMOS_BASE_URL = os.getenv("COSMOS_BASE_URL", "http://127.0.0.1:8001/v1")
+COSMOS_NUM_FRAMES = int(os.getenv("COSMOS_NUM_FRAMES", "8"))   # nvcf: frames sampled per clip
+COSMOS_FPS = float(os.getenv("COSMOS_FPS", "2"))               # openai: sampling fps
+COSMOS_MAX_TOKENS = int(os.getenv("COSMOS_MAX_TOKENS", "512"))
 
 # W&B Inference + Weave
 WANDB_API_KEY = os.getenv("WANDB_API_KEY", "")

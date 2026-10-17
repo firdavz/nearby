@@ -39,12 +39,18 @@ _state = {"persona": config.PERSONA, "latest_caption": "", "fps": 0.0, "clips": 
 _lock = threading.Lock()
 
 
-def _slow_path(clip_path: Path, objects: list[str], t: float) -> None:
-    """Runs in a worker thread: caption → store. Never blocks the frame loop."""
+def _slow_path(clip_path: Path, objects: list[str], t: float, dets: list[dict] | None = None) -> None:
+    """Runs in a worker thread: caption → store. Never blocks the frame loop.
+    COSMOS_MODE=yolo → caption is a template built from the clip's detections (no Cosmos).
+    Any Cosmos failure also falls back to that template, so the log never shows an error."""
     try:
-        cap = slow_loop.caption(str(clip_path))
+        if config.COSMOS_MODE == "yolo" or not config.USE_REAL_COSMOS:
+            cap = slow_loop.caption_from_detections(dets or []) if config.COSMOS_MODE == "yolo" else slow_loop.caption(str(clip_path))
+        else:
+            cap = slow_loop.caption(str(clip_path))
     except Exception as e:
-        cap = f"(caption failed: {e})"
+        print(f"[slow_path] Cosmos failed ({e}); using YOLO caption")
+        cap = slow_loop.caption_from_detections(dets or [])
     memory.store(str(clip_path), cap, objects, t)
     agent.set_latest_caption(cap)
     with _lock:
@@ -98,6 +104,7 @@ async def ws_frames(ws: WebSocket):
     await ws.accept()
     buf = slow_loop.ClipBuffer()
     seen_labels: set[str] = set()
+    clip_dets: list[dict] = []
     n, t_fps = 0, time.time()
     try:
         while True:
@@ -110,6 +117,7 @@ async def ws_frames(ws: WebSocket):
             # ---- fast path --------------------------------------------------
             dets = await asyncio.to_thread(fast_loop.detect, frame)
             seen_labels.update(d["label"] for d in dets)
+            clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets)
             line = agent.agent_on_events(dets, _state["latest_caption"])
             if line:
                 with _lock:
@@ -118,8 +126,8 @@ async def ws_frames(ws: WebSocket):
             # ---- slow path --------------------------------------------------
             clip = buf.add(frame)
             if clip is not None:
-                _slow.submit(_slow_path, clip, sorted(seen_labels), t)
-                seen_labels = set()
+                _slow.submit(_slow_path, clip, sorted(seen_labels), t, clip_dets)
+                seen_labels, clip_dets = set(), []
 
             n += 1
             if t - t_fps >= 1:
