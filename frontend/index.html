@@ -16,6 +16,7 @@
     --accent:#a78bfa; --accent-dim:rgba(167,139,250,.12); --warn:#f2b134; --urgent:#ff5c5c;
     --title:linear-gradient(100deg, #eceafb 35%, #a78bfa);
     --btn-fill:linear-gradient(135deg, rgba(167,139,250,.18), rgba(124,92,255,.05));
+    --btn-fill-strong:linear-gradient(135deg, rgba(167,139,250,.34), rgba(124,92,255,.12)); --border-mid:rgba(167,139,250,.3);
     --glow:0 0 0 1px #a78bfa, 0 0 24px rgba(167,139,250,.35);
     --shine:linear-gradient(105deg, transparent 35%, rgba(236,234,251,.32) 50%, transparent 65%);
     --head:"Plus Jakarta Sans", system-ui, sans-serif; --body:"Inter", system-ui, sans-serif;
@@ -26,8 +27,13 @@
   body::before { content:""; position:fixed; inset:0; background:var(--bg-glow); pointer-events:none; z-index:-1 }
   :focus-visible { outline:2px solid var(--accent); outline-offset:2px }
 
-  header { display:flex; flex-wrap:wrap; gap:10px 12px; align-items:center; padding:18px 24px; border-bottom:1px solid var(--border) }
-  header h1 { margin:0 10px 0 0; font:800 26px/1.1 var(--head); letter-spacing:-.03em;
+  /* header: brand on the left, then two framed trays (voice + mode | camera), so groups never mix when they wrap */
+  header { display:flex; flex-wrap:wrap; gap:14px 16px; align-items:center; padding:18px 24px; border-bottom:1px solid var(--border) }
+  header .brand { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px }
+  header .group { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px; background:var(--surface);
+                  border:1px solid var(--border); border-radius:var(--radius) }
+  header .group label.caption { padding-left:8px }
+  header h1 { margin:0; font:800 26px/1.1 var(--head); letter-spacing:-.03em;
               background:var(--title); -webkit-background-clip:text; background-clip:text; color:transparent }
   header .sp { flex:1 }
   #status { display:inline-flex; align-items:center; gap:8px; font:600 11.5px/1 var(--body); letter-spacing:.14em; text-transform:uppercase }
@@ -37,24 +43,34 @@
   button, select, input { font:500 14px/1.2 var(--body); color:var(--fg); background:transparent; border:1px solid var(--border);
     border-radius:var(--radius-btn); padding:9px 14px;
     transition:border-color .2s var(--ease), box-shadow .2s var(--ease), background-color .2s var(--ease), transform .2s var(--ease) }
-  button { cursor:pointer }
-  button:hover, select:hover { border-color:var(--border-strong) }
+  /* every button + the voice select: violet edge, inner gradient, glow on hover, one shine sweep.
+     Primary (Start camera, Ask) is a step brighter. Emoji render as plain monochrome icons where the OS has them. */
+  button, select { background:var(--btn-fill); border-color:var(--border-strong) }
+  button { position:relative; overflow:hidden; cursor:pointer; font-weight:600; font-variant-emoji:text }
+  button:hover, button:focus-visible, select:hover, select:focus-visible { border-color:var(--accent); box-shadow:var(--glow) }
+  button::after { content:""; position:absolute; inset:0; background:var(--shine); transform:translateX(-120%); pointer-events:none }
+  button:hover::after { animation:shine .6s var(--ease) 1 }
   button:active { transform:scale(.97) }
-  button:disabled { opacity:.45; cursor:default; transform:none; border-color:var(--border) }
+  button:disabled { opacity:.45; cursor:default; transform:none; box-shadow:none; border-color:var(--border) }
+  button:disabled::after { content:none }
+  button.primary { background:var(--btn-fill-strong); border-color:var(--accent) }
   select { appearance:none; -webkit-appearance:none; padding-right:32px; cursor:pointer;
-    background:transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a78bfa' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right 12px center }
+    background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a78bfa' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right 12px center, var(--btn-fill) }
   select option { background:var(--bg); color:var(--fg) }
+  input { border-color:var(--border-mid) }
   input::placeholder { color:var(--muted) }
   input:focus { border-color:var(--accent) }
-  /* primary: violet edge, inner gradient, glow on hover, one shine sweep */
-  button.primary { position:relative; overflow:hidden; background:var(--btn-fill); border-color:var(--border-strong); font-weight:600 }
-  button.primary:hover, button.primary:focus-visible { border-color:var(--accent); box-shadow:var(--glow) }
-  button.primary::after { content:""; position:absolute; inset:0; background:var(--shine); transform:translateX(-120%); pointer-events:none }
-  button.primary:hover::after { animation:shine .6s var(--ease) 1 }
   @keyframes shine { to { transform:translateX(120%) } }
 
   main { display:grid; grid-template-columns: 3fr 2fr; gap:24px; padding:24px; max-width:1440px; margin:0 auto }
-  @media (max-width: 900px) { main { grid-template-columns:1fr; gap:16px; padding:16px } header { padding:14px 16px } }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; gap:16px; padding:16px } header { padding:14px 16px }
+    header .sp { display:none } header .group { flex:1 1 auto } }
+  /* phones: each tray is a 2-column grid of equal buttons; the voice picker spans the top row */
+  @media (max-width: 600px) {
+    header .group { flex-basis:100%; display:grid; grid-template-columns:1fr 1fr }
+    header .group > button { width:100% }
+    header .group label.caption { grid-column:1 / -1; display:flex } header .group label.caption select { flex:1 }
+    .panel .row { display:grid; grid-template-columns:1fr 1fr } .panel .row input { grid-column:1 / -1 } }
   .stage { position:relative; background:#05070f; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; aspect-ratio:4/3 }
   .stage video, .stage canvas { position:absolute; inset:0; width:100%; height:100% }
   .stage .flash { position:absolute; inset:0; pointer-events:none; box-shadow: inset 0 0 0 0 var(--urgent); transition: box-shadow .15s }
@@ -86,7 +102,7 @@
   .timeline .cues { display:flex; flex-wrap:wrap; gap:6px; max-height:120px; overflow:auto }
   .timeline .cues button { padding:5px 9px; font-size:13px } .timeline .cues button b { font-weight:600; color:var(--muted); margin-right:6px }
   .timeline .cues button.warn { border-color:var(--warn) } .timeline .cues button.urgent { border-color:var(--urgent) }
-  .timeline .cues button.now { background:var(--btn-fill) }
+  .timeline .cues button.now { background:var(--btn-fill-strong); box-shadow:var(--glow) }   /* every button has a fill now, so the current cue glows */
   .hud { position:absolute; left:12px; top:12px; background:rgba(11,16,36,.72); border:1px solid var(--border); padding:6px 10px;
          border-radius:8px; font:500 12px/1.3 var(--body); font-variant-numeric:tabular-nums; color:var(--muted) }
   .panel { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; display:flex; flex-direction:column; gap:12px; min-height:0 }
@@ -97,7 +113,7 @@
           background:var(--accent-dim); border-left:2px solid var(--accent) }
   .said.warn { border-color:var(--warn); background:rgba(242,177,52,.08) } .said.urgent { border-color:var(--urgent); background:rgba(255,92,92,.1) }
   .caption { color:var(--muted); font-size:14px }
-  .row { display:flex; flex-wrap:wrap; gap:8px } .row input { flex:1 1 180px; min-width:0 }
+  .row { display:flex; flex-wrap:wrap; gap:8px } .row input { flex:1 1 120px; min-width:0 }
   .log { overflow:auto; max-height:40vh; display:flex; flex-direction:column; font-size:14px; scrollbar-width:thin; scrollbar-color:var(--border) transparent }
   .log .item { padding:9px 2px; border-bottom:1px solid rgba(167,139,250,.08); display:flex; gap:12px; align-items:flex-start }
   .log .k { display:inline-flex; align-items:center; gap:8px; font:600 11px/1.9 var(--body); text-transform:uppercase; letter-spacing:.14em; color:var(--muted); min-width:76px }
@@ -113,21 +129,27 @@
 </head>
 <body>
 <header>
-  <h1>Second Sight</h1>
-  <span class="caption" id="status">camera off</span>
+  <div class="brand">
+    <h1>Second Sight</h1>
+    <span class="caption" id="status">camera off</span>
+  </div>
   <span class="sp"></span>
-  <label class="caption">voice
-    <select id="persona"><option value="calm">Calm</option><option value="attenborough">Attenborough</option></select>
-  </label>
-  <button id="mode" title="Steering only; click to switch to scene descriptions">🧭 Guide</button>
-  <button id="mute">🔊 sound on</button>
-  <button id="usevideo" title="Play a first-person video as the person's eyes">🎞 Use video</button>
-  <input type="file" id="vfile" accept="video/*" hidden>
-  <button id="pausebtn" hidden>⏸ Pause</button>
-  <button id="stopbtn" hidden>⏹ Stop</button>
-  <button id="uploadbtn" title="Run a recorded video through the live pipeline and watch it annotated">⬆ Upload video</button>
-  <input type="file" id="ufile" accept="video/*" hidden>
-  <button class="primary" id="start">Start camera</button>
+  <div class="group" role="group" aria-label="Voice and mode">
+    <label class="caption">voice
+      <select id="persona"><option value="calm">Calm</option><option value="attenborough">Attenborough</option></select>
+    </label>
+    <button id="mode" title="Steering only; click to switch to scene descriptions">➤ Guide</button>
+    <button id="mute">🔊 sound on</button>
+  </div>
+  <div class="group" role="group" aria-label="Camera">
+    <button id="usevideo" title="Play a first-person video as the person's eyes">🎞 Use video</button>
+    <input type="file" id="vfile" accept="video/*" hidden>
+    <button id="pausebtn" hidden>⏸ Pause</button>
+    <button id="stopbtn" hidden>⏹ Stop</button>
+    <button id="uploadbtn" title="Run a recorded video through the live pipeline and watch it annotated">⬆ Upload video</button>
+    <input type="file" id="ufile" accept="video/*" hidden>
+    <button class="primary" id="start">Start camera</button>
+  </div>
 </header>
 
 <main>
@@ -378,7 +400,7 @@ async function compassOn() {                       // call from a user gesture: 
 function compassOff() { if (orientOn) window.removeEventListener('deviceorientation', onOrient); orientOn = false; lastHeading = null; }
 function setGuide(on) {
   guide = on; document.body.classList.toggle('guide', on);
-  $('mode').textContent = on ? '🧭 Guide' : '💬 Describe';
+  $('mode').textContent = on ? '➤ Guide' : '💬 Describe';
   $('mode').title = on ? 'Steering only; click to switch to scene descriptions' : 'Describing the scene; click to switch to steering only';
   if (on) { compassOn(); sendJSON({ type: 'nav', action: 'start', heading: lastHeading }); }
   else { sendJSON({ type: 'nav', action: 'stop' }); }
