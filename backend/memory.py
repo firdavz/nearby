@@ -1,9 +1,10 @@
 """MEMORY — store / search / last_seen.  Owner: A.
 
 FAKE: in-process list + keyword search (works from minute one).
-REAL: clips uploaded to a VAST S3 bucket; captions + YOLO object labels + embeddings kept in
-SQLite (swap for VAST DB when the cluster has it); search is cosine over caption embeddings
-(NIM/W&B embedding model, or a local hashed embedding if no key is set).
+REAL: clips uploaded to VAST S3 (team DB bucket, second-sight/clips/); captions + YOLO object
+labels + embeddings kept in SQLite (VAST DB mirror next); search is cosine over NVIDIA Cosmos
+Embed1 caption vectors (local hashed embedding if the GPU host is unreachable). Clips play via
+main.py's /clips/, pulled back from VAST if the local copy is missing.
 
 Both implementations share the same tiny interface, and both record the *YOLO labels* seen in
 each clip — that's what makes last_seen("cup") exact rather than a fuzzy caption match.
@@ -12,8 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -79,44 +82,130 @@ def last_seen_fake(label: str) -> MemoryHit | None:
 
 
 # --------------------------------------------------------------------------- REAL
+# On the lab VM the team credentials live in /config/<team>.config under VAST's own names
+# (S3_ENDPOINT, ACCESS_KEY, ...). Read those directly so no secrets get copied into .env.
+def _team_config() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for f in sorted(Path("/config").glob("*.config")) if Path("/config").is_dir() else []:
+        for line in f.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                out[k.strip().removeprefix("export ").strip()] = v.strip().strip('"')
+    return out
+
+
+_CFG = _team_config()
+
+
+def _env(*names: str, default: str = "") -> str:
+    """First non-empty value among our .env names, then VAST's names in /config."""
+    for n in names:
+        v = getattr(config, n, "") or os.getenv(n, "") or _CFG.get(n, "")
+        if v:
+            return v
+    return default
+
+
+S3_ENDPOINT = _env("VAST_S3_ENDPOINT", "S3_ENDPOINT")
+S3_ACCESS = _env("VAST_ACCESS_KEY", "ACCESS_KEY")
+S3_SECRET = _env("VAST_SECRET_KEY", "SECRET_KEY")
+# Clips go in the team's own DB bucket under a prefix: the chunks/segments buckets trigger
+# VAST's ingest pipeline, and creating new buckets isn't allowed for team users.
+S3_BUCKET = _env("VASTDB_BUCKET") or config.VAST_BUCKET
+S3_PREFIX = "second-sight/clips/"
+
+# Cosmos Embed1 on the shared GPU host (256-dim). Override with EMBED1_URL if it moves.
+EMBED1_URL = _env("EMBED1_URL", "COSMOS_EMBED1_URL", default="http://166.19.38.112:8003")
+GPU_TOKEN = _env("GPU_BEARER_TOKEN")
+
+
+def _cosmos_embed(text: str, kind: str) -> np.ndarray | None:
+    """Cosmos Embed1 vector, or None if the GPU host can't be reached."""
+    if not GPU_TOKEN:
+        return None
+    import httpx
+    try:
+        r = httpx.post(f"{EMBED1_URL}/v1/embeddings", timeout=15,
+                       headers={"Authorization": f"Bearer {GPU_TOKEN}"},
+                       json={"input": text, "model": "nvidia/cosmos-embed1",
+                             # Embed1 only accepts query / bulk_text / bulk_video
+                             "request_type": "query" if kind == "query" else "bulk_text",
+                             "encoding_format": "float"})
+        r.raise_for_status()
+        v = np.array(r.json()["data"][0]["embedding"], dtype=np.float32)
+        return v / np.linalg.norm(v)
+    except Exception as e:
+        print(f"[memory] Cosmos Embed failed, using local embedding: {e}")
+        return None
+
+
+def real_embed(text: str, kind: str = "passage") -> np.ndarray:
+    """Cosmos Embed1 when the GPU token is there; otherwise the .env embedding / local fallback."""
+    if GPU_TOKEN and not config.EMBED_API_KEY:
+        v = _cosmos_embed(text, kind)
+        if v is not None:
+            return v
+    return embed(text, kind)
+
+
 class RealMemory:
     def __init__(self):
         db = config.ROOT / "data/memory.sqlite"
         db.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()   # store() runs on the thread pool, search() on requests
         self.con = sqlite3.connect(db, check_same_thread=False)
         self.con.execute("CREATE TABLE IF NOT EXISTS clips (t REAL, caption TEXT, objects TEXT, key TEXT, emb BLOB)")
         self.con.commit()
         self.s3 = None
-        if config.VAST_S3_ENDPOINT and config.VAST_ACCESS_KEY:
+        if S3_ENDPOINT and S3_ACCESS:
             import boto3
-            self.s3 = boto3.client("s3", endpoint_url=config.VAST_S3_ENDPOINT,
-                                   aws_access_key_id=config.VAST_ACCESS_KEY,
-                                   aws_secret_access_key=config.VAST_SECRET_KEY)
-            try:
-                self.s3.head_bucket(Bucket=config.VAST_BUCKET)
-            except Exception:
-                self.s3.create_bucket(Bucket=config.VAST_BUCKET)
+            import urllib3
+            urllib3.disable_warnings()   # the lab cluster uses a self-signed cert (VAST's skills do the same)
+            self.s3 = boto3.client("s3", endpoint_url=S3_ENDPOINT, aws_access_key_id=S3_ACCESS,
+                                   aws_secret_access_key=S3_SECRET, verify=False)
+            print(f"[memory] VAST S3 on, bucket {S3_BUCKET}/{S3_PREFIX}")
+        else:
+            print("[memory] no VAST credentials found, clips stay local only")
 
     def store(self, clip_path: str, caption: str, objects: list[str], t: float) -> None:
         key = clip_path
         if self.s3:
-            key = f"clips/{Path(clip_path).name}"
-            self.s3.upload_file(clip_path, config.VAST_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
+            try:
+                key = S3_PREFIX + Path(clip_path).name
+                self.s3.upload_file(clip_path, S3_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
+            except Exception as e:
+                print(f"[memory] S3 upload failed, keeping clip local: {e}")
+                key = clip_path
         text = caption + " Objects: " + ", ".join(objects)
-        self.con.execute("INSERT INTO clips VALUES (?,?,?,?,?)",
-                         (t, caption, json.dumps([o.lower() for o in objects]), key, embed(text).tobytes()))
-        self.con.commit()
+        emb = real_embed(text, "passage")
+        with self.lock:
+            self.con.execute("INSERT INTO clips VALUES (?,?,?,?,?)",
+                             (t, caption, json.dumps([o.lower() for o in objects]), key, emb.tobytes()))
+            self.con.commit()
 
     def _url(self, key: str) -> str:
-        if self.s3 and key.startswith("clips/"):
-            return self.s3.generate_presigned_url("get_object", Params={"Bucket": config.VAST_BUCKET, "Key": key}, ExpiresIn=3600)
+        """Browsers can't reach the VAST endpoint, so clips are always played through main.py's
+        /clips/. If the local copy is gone, pull it back down from VAST first."""
+        local = config.CLIP_DIR / Path(key).name
+        if self.s3 and key.startswith(S3_PREFIX) and not local.exists():
+            try:
+                local.parent.mkdir(parents=True, exist_ok=True)
+                self.s3.download_file(S3_BUCKET, key, str(local))
+            except Exception as e:
+                print(f"[memory] couldn't fetch {key} from VAST: {e}")
         return clip_url_for(key)
 
+    def _rows(self, sql: str) -> list[tuple]:
+        with self.lock:
+            return self.con.execute(sql).fetchall()
+
     def search(self, query: str) -> list[MemoryHit]:
-        rows = self.con.execute("SELECT t, caption, objects, key, emb FROM clips").fetchall()
+        q = real_embed(query, "query")
+        # Only compare vectors from the same model (the local fallback has a different size).
+        rows = [r for r in self._rows("SELECT t, caption, objects, key, emb FROM clips")
+                if len(r[4]) == q.nbytes]
         if not rows:
             return []
-        q = embed(query, "query")
         M = np.stack([np.frombuffer(r[4], dtype=np.float32) for r in rows])
         scores = M @ q
         top = np.argsort(-scores)[:5]
@@ -124,7 +213,7 @@ class RealMemory:
 
     def last_seen(self, label: str) -> MemoryHit | None:
         label = label.lower().rstrip("s")
-        for t, cap, objs, key, _ in self.con.execute("SELECT * FROM clips ORDER BY t DESC").fetchall():
+        for t, cap, objs, key, _ in self._rows("SELECT * FROM clips ORDER BY t DESC"):
             if any(label in o for o in json.loads(objs)) or label in cap.lower():
                 return {"t": t, "caption": cap, "clip_url": self._url(key)}
         return None
