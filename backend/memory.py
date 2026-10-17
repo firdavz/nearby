@@ -80,9 +80,18 @@ def search_fake(query: str) -> list[MemoryHit]:
     return [{"t": m["t"], "caption": m["caption"], "clip_url": clip_url_for(m["clip"])} for _, _, m in scored[:5]]
 
 
+def note_caption(note: str) -> str:
+    """'my pills are in the drawer' -> 'You told me your pills are in the drawer.' (read back to the user)"""
+    swaps = {"my": "your", "mine": "yours", "i": "you", "i'm": "you're", "im": "you're", "me": "you", "myself": "yourself",
+             "i am": "you are", "i was": "you were"}
+    text = re.sub(r"\b(i am|i was|i'm|im|myself|mine|my|me|i)\b", lambda m: swaps[m.group(1).lower()],
+                  note.strip().rstrip("."), flags=re.I)
+    return f"You told me {text}."
+
+
 def remember_fake(note: str, t: float | None = None) -> None:
     t = time.time() if t is None else t
-    _fake.append({"t": t, "caption": f"The user told me: {note.strip().rstrip('.')}.", "objects": [],
+    _fake.append({"t": t, "caption": note_caption(note), "objects": [],
                   "clip": f"{NOTE_PREFIX}{t:.3f}", "sides": {}})
 
 
@@ -367,7 +376,7 @@ class RealMemory:
         """Save something the user told us ("my medication is in the top drawer") as a memory with
         no clip. It's found by search/last_seen/recall like any caption, and lands in VAST DB too."""
         t = time.time() if t is None else t
-        caption = f"The user told me: {note.strip().rstrip('.')}."
+        caption = note_caption(note)
         key = f"{NOTE_PREFIX}{t:.3f}"
         emb = real_embed(caption, "passage")
         with self.lock:
