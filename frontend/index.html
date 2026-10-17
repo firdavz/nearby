@@ -68,30 +68,69 @@ const $ = id => document.getElementById(id);
 const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
 let ws, sending = false, muted = false;
 
-// ---------- audio: panned earcon + speech -------------------------------------------
+// ---------- audio: panned earcon, then speech  (owner: C) ----------------------------
 // Browser speechSynthesis can't be routed through Web Audio, so direction comes from a short
-// panned tone played just before the sentence; the voice itself is centre. Good enough, and instant.
+// panned tone played just before the sentence; the voice itself is centre.
+// Best voices are Edge's "Natural" ones (online) — run the demo in Edge. Falls back to Chrome's
+// Google voices, then Windows' offline voices, so it never goes silent. ?voice=<name> overrides.
 const AC = new (window.AudioContext || window.webkitAudioContext)();
-function earcon(side, urgency) {
-  if (muted) return;
-  const o = AC.createOscillator(), g = AC.createGain(), p = AC.createStereoPanner();
-  p.pan.value = side === 'left' ? -1 : side === 'right' ? 1 : 0;
-  o.frequency.value = urgency === 'urgent' ? 880 : 520;
-  o.type = urgency === 'urgent' ? 'square' : 'sine';
-  g.gain.setValueAtTime(0.0001, AC.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.4, AC.currentTime + 0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + (urgency === 'urgent' ? 0.25 : 0.12));
-  o.connect(g).connect(p).connect(AC.destination); o.start(); o.stop(AC.currentTime + 0.3);
+const VOICE_PREFS = {
+  calm:         ['Sonia Online (Natural)', 'Libby Online (Natural)', 'Google UK English Female', 'Hazel', 'Susan'],
+  attenborough: ['Thomas Online (Natural)', 'Ryan Online (Natural)', 'Google UK English Male', 'George', 'Daniel'],
+};
+const VOICE_STYLE = { calm: { rate: 1.0, pitch: 1.0 }, attenborough: { rate: 0.88, pitch: 0.9 } };
+let voices = [];
+function loadVoices() {
+  voices = speechSynthesis.getVoices();
+  if (voices.length) console.log('voices:', voices.map(v => v.name), '→ using', pickVoice('calm')?.name, '/', pickVoice('attenborough')?.name);
 }
+speechSynthesis.onvoiceschanged = loadVoices; loadVoices();
+function pickVoice(persona) {
+  const forced = new URLSearchParams(location.search).get('voice');
+  for (const want of [forced, ...(VOICE_PREFS[persona] || VOICE_PREFS.calm)].filter(Boolean)) {
+    const v = voices.find(v => v.name.includes(want));
+    if (v) return v;
+  }
+  return voices.find(v => v.lang === 'en-GB') || voices.find(v => v.lang.startsWith('en')) || null;
+}
+
+// info: soft two-note chime (120 ms). urgent: 250 ms square wave, low-passed so it's alarming, not harsh.
+function earcon(side, urgency) {
+  if (muted) return 0;
+  const t = AC.currentTime, urgent = urgency === 'urgent', dur = urgent ? 0.25 : 0.12;
+  const p = AC.createStereoPanner(); p.pan.value = side === 'left' ? -1 : side === 'right' ? 1 : 0;
+  const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(urgent ? 0.25 : 0.35, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = urgent ? 2400 : 6000;
+  g.connect(lp).connect(p).connect(AC.destination);
+  const o = AC.createOscillator(); o.type = urgent ? 'square' : 'sine';
+  if (urgent) { o.frequency.setValueAtTime(880, t); o.frequency.setValueAtTime(660, t + dur / 2); }
+  else { o.frequency.setValueAtTime(660, t); o.frequency.setValueAtTime(880, t + dur / 2); }
+  o.connect(g); o.start(t); o.stop(t + dur + 0.02);
+  return dur * 1000;
+}
+
+let lastUrgentAt = 0;
 function speak(text, side, urgency) {
   if (!text) return;
-  earcon(side, urgency);
+  const urgent = urgency === 'urgent';
+  const answer = urgency === 'answer';                                   // reply to the user's own question
+  if (urgent) { speechSynthesis.cancel(); lastUrgentAt = Date.now(); }   // a hazard interrupts any chatter
+  else if (!answer && Date.now() - lastUrgentAt < 1500) return;          // chatter doesn't talk over a fresh warning
+  const toneMs = earcon(side, urgency);
   if (muted) return;
+  const persona = $('persona').value;                                    // read now, so the toggle is live
   const u = new SpeechSynthesisUtterance(text);
-  u.rate = urgency === 'urgent' ? 1.25 : 1.0;
-  if ($('persona').value === 'attenborough') { u.rate = 0.9; u.pitch = 0.8; }
-  if (urgency === 'urgent') speechSynthesis.cancel();   // never queue behind chatter
-  speechSynthesis.speak(u);
+  const v = pickVoice(persona); if (v) { u.voice = v; u.lang = v.lang; }
+  const st = VOICE_STYLE[persona] || VOICE_STYLE.calm;
+  u.rate = urgent ? 1.2 : st.rate; u.pitch = urgent ? 1.0 : st.pitch;
+  const queuedAt = Date.now();
+  setTimeout(() => {                                                     // tone first, then the voice
+    if (urgent) speechSynthesis.cancel();                                // catch chatter that started meanwhile
+    else if (!answer && lastUrgentAt > queuedAt) return;                 // a hazard arrived while we waited
+    speechSynthesis.speak(u);
+  }, toneMs + 20);
 }
 function show(text, urgency) { const s = $('said'); s.textContent = text; s.className = 'said ' + (urgency || ''); }
 function logItem(kind, text, clip) {
@@ -147,7 +186,7 @@ $('askform').onsubmit = async e => {
   e.preventDefault(); const q = $('q').value.trim(); if (!q) return; $('q').value = '';
   logItem('you', q);
   const a = await (await fetch('/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }) })).json();
-  show(a.text, 'info'); speak(a.text, null, 'info'); logItem('answer', a.text, a.clip_url);
+  show(a.text, 'info'); speak(a.text, null, 'answer'); logItem('answer', a.text, a.clip_url);
 };
 $('persona').onchange = e => fetch('/persona', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ persona: e.target.value }) });
 $('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇 muted' : '🔊 sound on'; if (muted) speechSynthesis.cancel(); };
