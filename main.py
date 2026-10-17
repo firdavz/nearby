@@ -26,7 +26,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import agent, config, fast_loop, memory, slow_loop
-from backend.contracts import crowd_alert, is_hazard
+from backend.contracts import crowd_alert, fixed_alert, is_hazard
+from backend.navigate import NavState, guidance_sentence, guide_side, steer
 
 app = FastAPI(title="Second Sight")
 config.CLIP_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,14 +144,40 @@ async def ws_frames(ws: WebSocket):
     clip_dets: list[dict] = []
     n, t_fps = 0, time.time()
     last_urgent = 0.0
+    nav = NavState()                        # guide mode: corridor steering, per connection, on by default
+    nav.start(None)
+    last_guidance = 0.0
+    last_hazard = {"text": "", "t": 0.0}   # guide mode repeats an urgent alert at most every 2 s
     q: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    def control(text: str) -> None:
+        """Text messages are JSON controls: nav start/stop and compass headings."""
+        try:
+            m = json.loads(text)
+        except ValueError:
+            return
+        if m.get("type") == "nav":
+            if m.get("action") == "start":
+                h = m.get("heading")
+                nav.start(float(h) if h is not None else None)
+            elif m.get("action") == "stop":
+                nav.stop()
+        elif m.get("type") == "heading" and m.get("heading") is not None:
+            nav.heading = float(m["heading"])
 
     async def reader() -> None:
         try:
             while True:
-                q.put_nowait(await ws.receive_bytes())
-        except (WebSocketDisconnect, RuntimeError, KeyError):
-            q.put_nowait(None)              # KeyError: a non-binary message; treat like a close
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                if msg.get("bytes") is not None:
+                    q.put_nowait(msg["bytes"])
+                elif msg.get("text"):
+                    control(msg["text"])
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        q.put_nowait(None)
 
     reader_task = asyncio.create_task(reader())
     try:
@@ -169,7 +196,8 @@ async def ws_frames(ws: WebSocket):
             if frame is None:
                 await ws.send_text(json.dumps({"detections": [], "hazard": False, "say": None,
                                                "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
-                                               "dropped": dropped}))
+                                               "dropped": dropped,
+                                               "nav": {"active": nav.active, "offset": nav.offset, "last": nav.last_cue}}))
                 continue
             t = time.time()
 
@@ -177,8 +205,26 @@ async def ws_frames(ws: WebSocket):
             dets = await asyncio.to_thread(fast_loop.detect, frame)
             seen_labels.update(d["label"] for d in dets)
             clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets)
-            # scene-level crowding rule first (fast path, fixed text); otherwise C's per-object hazards + chatter
-            line = crowd_alert(dets) or agent.agent_on_events(dets, _state["latest_caption"])
+            H, W = frame.shape[:2]
+            if nav.active:
+                # guide mode: steering cues, else urgent hazards, else a reasoned phrase at most every 6 s.
+                # No crowding rule, no agent chatter: objects are only described when asked.
+                line = steer(dets, W, H, nav)
+                if line is None:
+                    hz = [d for d in dets if is_hazard(d)]
+                    if hz:
+                        alert = fixed_alert(hz[0])
+                        if alert["text"] != last_hazard["text"] or t - last_hazard["t"] >= 2.0:
+                            last_hazard.update(text=alert["text"], t=t)
+                            line = alert
+                if line is None and t - last_guidance >= 6.0:
+                    g = guidance_sentence(dets, W, H, _state["latest_caption"])
+                    if g:
+                        last_guidance = t
+                        line = {"text": g, "side": guide_side(dets, W, H), "urgency": "info"}
+            else:
+                # scene-level crowding rule first (fast path, fixed text); otherwise C's per-object hazards + chatter
+                line = crowd_alert(dets) or agent.agent_on_events(dets, _state["latest_caption"])
             if line:
                 with _lock:
                     _log.append({"t": t, "kind": line["urgency"], "text": line["text"]})
@@ -203,6 +249,7 @@ async def ws_frames(ws: WebSocket):
                 "detections": dets, "hazard": flash,
                 "say": line, "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
                 "dropped": dropped, "crowded": sum(d["distance"] != "far" for d in dets) >= 3,
+                "nav": {"active": nav.active, "offset": nav.offset, "last": nav.last_cue},
             }))
     except WebSocketDisconnect:
         pass
