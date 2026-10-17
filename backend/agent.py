@@ -153,6 +153,13 @@ def agent_on_events_fake(events: list[Detection], caption: str) -> AgentLine | N
 
 
 OBJECT_WORDS = ("keys", "phone", "wallet", "glasses", "cup", "bag", "backpack", "bottle", "laptop")
+PLURAL_WORDS = ("keys", "glasses")
+# A's memory adds an optional hit["side"]: where the object was in view when it was last seen.
+_SIDE_WORDS = {"left": "on your left", "right": "on your right", "centre": "straight ahead of you"}
+
+
+def _side_words(hit: dict) -> str | None:
+    return _SIDE_WORDS.get(hit.get("side") or "")
 
 
 def agent_ask_fake(question: str) -> AgentAnswer:
@@ -161,7 +168,11 @@ def agent_ask_fake(question: str) -> AgentAnswer:
         if word in q:
             hit = memory.last_seen(word)
             if hit:
-                return {"text": f"I last saw your {word} {_fmt_t(hit['t'])}: {hit['caption']}", "clip_url": hit["clip_url"]}
+                was = "were" if word in PLURAL_WORDS else "was"
+                where = _side_words(hit)
+                head = f"Your {word} {was} {where}, {_fmt_t(hit['t'])}." if where else f"I last saw your {word} {_fmt_t(hit['t'])}."
+                cap = hit["caption"].rstrip(".")
+                return {"text": f"{head} I saw: {cap[:1].lower() + cap[1:]}.", "clip_url": hit["clip_url"]}
             return {"text": f"I haven't seen your {word} yet.", "clip_url": None}
     if "see" in q or "now" in q or "around" in q:
         return {"text": _latest_caption or "I can't see anything yet.", "clip_url": None}
@@ -229,15 +240,18 @@ def memory_lookup(question: str) -> dict:
     for word in asked:
         hit = memory.last_seen(word)
         if hit:
-            facts.append(f"last_seen({word}): {hit['caption']} ({_fmt_t(hit['t'])})")
+            where = _side_words(hit)
+            facts.append(f"last_seen({word}): {hit['caption']}" + (f" [side: {where}]" if where else "")
+                         + f" [time: {_fmt_t(hit['t'])}]")
             clip = clip or hit["clip_url"]
         else:
             facts.append(f"last_seen({word}): never seen")
     if not asked and not _is_now_question(q):  # a named object never seen must not borrow another clip
         for h in memory.search(question)[:3]:
-            facts.append(f"memory: {h['caption']} ({_fmt_t(h['t'])})")
+            facts.append(f"memory: {h['caption']} [time: {_fmt_t(h['t'])}]")
             clip = clip or h["clip_url"]
-    facts.append(f"camera right now: {_latest_caption or 'nothing yet'}")
+    if not asked or _is_now_question(q):   # for "where is my X" the live scene only confuses the model
+        facts.append(f"camera right now: {_latest_caption or 'nothing yet'}")
     return {"facts": facts, "clip_url": clip}
 
 
@@ -315,9 +329,10 @@ def agent_ask_real(question: str) -> AgentAnswer:
     _llm()  # make sure Weave (and so the traced lookup) is ready
     found = (_lookup or memory_lookup)(question)
     sysmsg = _system(
-        "Answer the person's question using ONLY the facts below. Say where, and how long ago using the "
-        "time phrase in brackets exactly as written (without the brackets). If the facts don't answer it, "
-        "say you haven't seen it. Never invent places or times. One or two short sentences, spoken aloud as-is.")
+        "Answer the person's question using ONLY the facts below. Say where it was — the [side: ...] phrase "
+        "if given, plus the place from the description — and how long ago using the [time: ...] phrase. "
+        "Use those phrases exactly as written, without brackets or labels. If the facts don't answer it, "
+        "say you haven't seen it. Never invent places, sides or times. One or two short sentences, spoken aloud as-is.")
     user = f"Question: {question}\nFacts:\n" + "\n".join(f"- {f}" for f in found["facts"])
     try:
         text = _complete(sysmsg, user)
