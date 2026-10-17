@@ -52,3 +52,9 @@ VAST_BUCKET = os.getenv("VAST_BUCKET", "second-sight")
 # Agent behaviour
 PERSONA = os.getenv("PERSONA", "calm")          # calm | attenborough
 SPEAK_COOLDOWN_S = float(os.getenv("SPEAK_COOLDOWN_S", "6"))
+
+# ElevenLabs voices (owner C). Blank key → browser speech, as before.
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "eleven_flash_v2_5")             # lowest latency
+ELEVEN_VOICE_CALM = os.getenv("ELEVEN_VOICE_CALM", "pFZP5JQG7iQjIQuC4Bku")  # Lily: warm British female
+ELEVEN_VOICE_DOC = os.getenv("ELEVEN_VOICE_DOC", "JBFqnCBsd6RMkjVDRZzb")    # George: warm British storyteller

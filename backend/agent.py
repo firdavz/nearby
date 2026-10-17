@@ -13,7 +13,7 @@ import json
 import threading
 import time
 
-from backend import config, memory
+from backend import config, memory, voice
 from backend.contracts import AgentAnswer, AgentLine, Detection, fixed_alert, is_hazard
 
 PERSONAS = {
@@ -235,6 +235,7 @@ def _think(events: list[Detection], caption: str) -> None:
     try:
         line = _decide(events, caption)
         if line:
+            line["audio_url"] = voice.tts(line["text"], config.PERSONA)  # render here, off the frame loop
             _pending.update(line=line, t=time.time())
     finally:
         _thinking["busy"] = False
@@ -283,7 +284,24 @@ def agent_ask_real(question: str) -> AgentAnswer:
 
 
 if config.USE_REAL_LLM:
-    agent_on_events, agent_ask = agent_on_events_real, agent_ask_real
+    _on_events, _ask = agent_on_events_real, agent_ask_real
     threading.Thread(target=_llm, daemon=True).start()  # warm up client + Weave so the first question isn't slow
 else:
-    agent_on_events, agent_ask = agent_on_events_fake, agent_ask_fake
+    _on_events, _ask = agent_on_events_fake, agent_ask_fake
+
+
+# ---- natural voice: an optional "audio_url" on every line (consumers that ignore it are unaffected)
+def agent_on_events(events: list[Detection], caption: str) -> AgentLine | None:
+    line = _on_events(events, caption)
+    if line and "audio_url" not in line:
+        line["audio_url"] = voice.cached_url(line["text"], config.PERSONA)  # never a network call on the frame loop
+    return line
+
+
+def agent_ask(question: str) -> AgentAnswer:
+    ans = _ask(question)
+    ans["audio_url"] = voice.tts(ans["text"], config.PERSONA)
+    return ans
+
+
+voice.warm_hazards()

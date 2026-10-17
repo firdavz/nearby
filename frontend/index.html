@@ -80,9 +80,16 @@ const VOICE_PREFS = {
 };
 const VOICE_STYLE = { calm: { rate: 1.0, pitch: 1.0 }, attenborough: { rate: 0.88, pitch: 0.9 } };
 let voices = [];
+let voicesShown = false;
 function loadVoices() {
   voices = speechSynthesis.getVoices();
-  if (voices.length) console.log('voices:', voices.map(v => v.name), '→ using', pickVoice('calm')?.name, '/', pickVoice('attenborough')?.name);
+  if (!voices.length) return;
+  console.log('voices:', voices.map(v => v.name));
+  if (!voicesShown) {
+    voicesShown = true;
+    const natural = voices.filter(v => /Natural|Google/.test(v.name)).length;
+    logItem('voice', `calm: ${pickVoice('calm')?.name} · documentary: ${pickVoice('attenborough')?.name} · ${voices.length} voices, ${natural} natural`);
+  }
 }
 speechSynthesis.onvoiceschanged = loadVoices; loadVoices();
 function pickVoice(persona) {
@@ -111,25 +118,45 @@ function earcon(side, urgency) {
   return dur * 1000;
 }
 
-let lastUrgentAt = 0;
-function speak(text, side, urgency) {
-  if (!text) return;
-  const urgent = urgency === 'urgent';
-  const answer = urgency === 'answer';                                   // reply to the user's own question
-  if (urgent) { speechSynthesis.cancel(); lastUrgentAt = Date.now(); }   // a hazard interrupts any chatter
-  else if (!answer && Date.now() - lastUrgentAt < 1500) return;          // chatter doesn't talk over a fresh warning
-  const toneMs = earcon(side, urgency);
-  if (muted) return;
+// ElevenLabs lines arrive as an audio_url; played through Web Audio so the VOICE itself is panned.
+const audioCache = new Map();          // url -> decoded buffer (hazard lines repeat, so replays are instant)
+let current = null;                    // the natural-voice clip playing now
+function stopAll() { speechSynthesis.cancel(); if (current) { try { current.stop(); } catch (e) {} current = null; } }
+function busy() { return !!current || speechSynthesis.speaking; }
+async function playNatural(url, side) {
+  let buf = audioCache.get(url);
+  if (!buf) { buf = await AC.decodeAudioData(await (await fetch(url)).arrayBuffer()); audioCache.set(url, buf); }
+  const src = AC.createBufferSource(); src.buffer = buf;
+  const p = AC.createStereoPanner(); p.pan.value = side === 'left' ? -0.7 : side === 'right' ? 0.7 : 0;
+  src.connect(p).connect(AC.destination);
+  src.onended = () => { if (current === src) current = null; };
+  current = src; src.start();
+}
+function speakBrowser(text, urgent) {
   const persona = $('persona').value;                                    // read now, so the toggle is live
   const u = new SpeechSynthesisUtterance(text);
   const v = pickVoice(persona); if (v) { u.voice = v; u.lang = v.lang; }
   const st = VOICE_STYLE[persona] || VOICE_STYLE.calm;
   u.rate = urgent ? 1.2 : st.rate; u.pitch = urgent ? 1.0 : st.pitch;
+  speechSynthesis.speak(u);
+}
+
+let lastUrgentAt = 0;
+function speak(text, side, urgency, audioUrl) {
+  if (!text) return;
+  const urgent = urgency === 'urgent';
+  const answer = urgency === 'answer';                                   // reply to the user's own question
+  if (urgent || answer) stopAll();                                       // hazards and answers cut in
+  else if (busy() || Date.now() - lastUrgentAt < 1500) return;           // chatter never talks over anything
+  if (urgent) lastUrgentAt = Date.now();
+  const toneMs = earcon(side, urgency);
+  if (muted) return;
   const queuedAt = Date.now();
-  setTimeout(() => {                                                     // tone first, then the voice
-    if (urgent) speechSynthesis.cancel();                                // catch chatter that started meanwhile
+  setTimeout(async () => {                                               // tone first, then the voice
+    if (urgent) stopAll();                                               // catch chatter that started meanwhile
     else if (!answer && lastUrgentAt > queuedAt) return;                 // a hazard arrived while we waited
-    speechSynthesis.speak(u);
+    if (audioUrl) { try { await playNatural(audioUrl, side); return; } catch (e) { console.warn('natural voice failed', e); } }
+    speakBrowser(text, urgent);                                          // no key / offline → browser voice
   }, toneMs + 20);
 }
 function show(text, urgency) { const s = $('said'); s.textContent = text; s.className = 'said ' + (urgency || ''); }
@@ -178,7 +205,7 @@ function onResult(r) {
   $('stage').classList.toggle('hazard', r.hazard);
   $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects`;
   if (r.caption) $('caption').textContent = r.caption;
-  if (r.say) { show(r.say.text, r.say.urgency); speak(r.say.text, r.say.side, r.say.urgency); logItem(r.say.urgency, r.say.text); }
+  if (r.say) { show(r.say.text, r.say.urgency); speak(r.say.text, r.say.side, r.say.urgency, r.say.audio_url); logItem(r.say.urgency, r.say.text); }
 }
 
 // ---------- ask, persona, mute -------------------------------------------------------
@@ -186,10 +213,10 @@ $('askform').onsubmit = async e => {
   e.preventDefault(); const q = $('q').value.trim(); if (!q) return; $('q').value = '';
   logItem('you', q);
   const a = await (await fetch('/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }) })).json();
-  show(a.text, 'info'); speak(a.text, null, 'answer'); logItem('answer', a.text, a.clip_url);
+  show(a.text, 'info'); speak(a.text, null, 'answer', a.audio_url); logItem('answer', a.text, a.clip_url);
 };
 $('persona').onchange = e => fetch('/persona', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ persona: e.target.value }) });
-$('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇 muted' : '🔊 sound on'; if (muted) speechSynthesis.cancel(); };
+$('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇 muted' : '🔊 sound on'; if (muted) stopAll(); };
 $('start').onclick = () => start().catch(err => { $('status').textContent = 'camera error: ' + err.message; });
 
 // pull captions written by the slow path even when nothing new is said
