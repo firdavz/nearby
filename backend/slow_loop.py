@@ -149,17 +149,27 @@ def caption_nvcf(clip_path: str) -> str:
 
 
 # ---- mode: openai (self-hosted NIM / vLLM) --------------------------------------
+def _resolve_model(client) -> str:
+    """Hackathon servers may expose a different id than the docs say; trust /v1/models."""
+    if config.COSMOS_MODEL and config.COSMOS_MODEL != "auto":
+        return config.COSMOS_MODEL
+    return client.models.list().data[0].id
+
+
 def caption_openai(clip_path: str) -> str:
-    from openai import OpenAI
-    client = OpenAI(base_url=config.COSMOS_BASE_URL, api_key=config.COSMOS_API_KEY or "none")
+    """Self-hosted Cosmos (NIM / vLLM / the hackathon's Cosmos3-Reason). Bearer = COSMOS_API_KEY."""
+    from openai import OpenAI, BadRequestError
+    client = OpenAI(base_url=config.COSMOS_BASE_URL, api_key=config.COSMOS_API_KEY or "none", timeout=90)
+    model = _resolve_model(client)
     b64 = base64.b64encode(Path(clip_path).read_bytes()).decode()
-    resp = client.chat.completions.create(
-        model=config.COSMOS_MODEL, max_tokens=config.COSMOS_MAX_TOKENS, temperature=0.2,
-        messages=[{"role": "user", "content": [
-            {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}},
-            {"type": "text", "text": PROMPT}]}],
-        extra_body={"media_io_kwargs": {"video": {"fps": float(config.COSMOS_FPS)}}},
-    )
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": PROMPT},
+        {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}}]}]
+    kwargs = dict(model=model, messages=messages, max_tokens=config.COSMOS_MAX_TOKENS, temperature=0.2)
+    try:  # sampling hint first; some servers reject unknown params → retry plain
+        resp = client.chat.completions.create(**kwargs, extra_body={"media_io_kwargs": {"video": {"fps": float(config.COSMOS_FPS)}}})
+    except BadRequestError:
+        resp = client.chat.completions.create(**kwargs)
     return _clean(resp.choices[0].message.content or "")
 
 

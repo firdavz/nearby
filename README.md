@@ -48,6 +48,29 @@ Captions without Cosmos: `USE_REAL_COSMOS=1` + `COSMOS_MODE=yolo` builds caption
 ("A cup on your right, mid; a person on your left, near."). `COSMOS_MODE=nvcf` (hosted) or `openai` (self-hosted NIM) call
 Cosmos Reason and fall back to the YOLO template on any error.
 
+## Running on the lab VM (team-48)
+
+Laptops cannot reach VAST S3, so the real stack runs on the VM over Cursor Remote-SSH. Forward port 8000 and open
+http://localhost:8000 locally so the browser can use the webcam. Team credentials live in `/config/team-48.config`;
+`memory.py` reads S3 and VAST DB creds from there itself. Never copy secrets into the repo (`.env` is gitignored).
+
+```bash
+# once per VM, in the repo root
+echo "COSMOS_MODE=openai" >> .env
+echo "COSMOS_BASE_URL=http://166.19.38.112:8001/v1" >> .env
+echo "COSMOS_MODEL=nvidia/cosmos3-nano-reasoner" >> .env
+echo "COSMOS_FPS=2" >> .env
+echo "COSMOS_API_KEY=$(grep ^GPU_BEARER_TOKEN= /config/team-48.config | cut -d= -f2-)" >> .env
+sed -i 's/^USE_REAL_COSMOS=.*/USE_REAL_COSMOS=1/; s/^USE_REAL_MEMORY=.*/USE_REAL_MEMORY=1/' .env
+python scripts/smoke.py                                   # real flags
+USE_REAL_COSMOS=0 USE_REAL_MEMORY=0 python scripts/smoke.py   # fakes
+uvicorn main:app --reload --port 8000
+```
+
+Cosmos3-Reason is OpenAI-compatible; the clip goes in as a base64 `video_url` with `media_io_kwargs.video.fps=2`
+(about 2-3 s per 5 s clip). Shared GPU host, bearer = `GPU_BEARER_TOKEN`. YOLO11s is on :8002, Embed1 on :8003.
+Install `ffmpeg` on the machine that writes clips, otherwise OpenCV falls back to mp4v which browsers cannot play.
+
 ## Behaviour rules already built in
 
 - **Hazard = closing + near.** Fixed text, never waits for the LLM. Repeats at most every 2 s while the danger persists.

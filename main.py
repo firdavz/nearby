@@ -51,7 +51,9 @@ def _slow_path(clip_path: Path, objects: list[str], t: float, dets: list[dict] |
     except Exception as e:
         print(f"[slow_path] Cosmos failed ({e}); using YOLO caption")
         cap = slow_loop.caption_from_detections(dets or [])
-    memory.store(str(clip_path), cap, objects, t)
+    # where each object was last seen in this clip, so last_seen() can say "on your right"
+    sides = {d["label"]: d["side"] for d in (dets or [])}
+    memory.store(str(clip_path), cap, objects, t, sides=sides)
     agent.set_latest_caption(cap)
     with _lock:
         _state["latest_caption"] = cap
