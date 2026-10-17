@@ -35,6 +35,7 @@
   .log .k { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); min-width:56px; padding-top:3px }
   .log .k.urgent{color:var(--urgent)} .log .k.warn{color:var(--warn)} .log .k.answer{color:var(--accent)}
   .log video { width:160px; border-radius:6px; margin-left:auto }
+  #mic.on { background:var(--urgent); color:#fff; border-color:transparent }
 </style>
 </head>
 <body>
@@ -68,6 +69,7 @@
     <div class="caption" id="caption">no scene description yet</div>
     <form class="row" id="askform">
       <input id="q" placeholder="where are my keys?  ·  what do you see?" autocomplete="off">
+      <button type="button" id="mic" title="Hold and talk (or hold Space); let go to ask">🎤 Hold to talk</button>
       <button class="primary">Ask</button>
     </form>
     <div class="log" id="log"></div>
@@ -306,8 +308,11 @@ function onResult(r) {
 }
 
 // ---------- ask, persona, mute -------------------------------------------------------
-$('askform').onsubmit = async e => {
+$('askform').onsubmit = e => {
   e.preventDefault(); const q = $('q').value.trim(); if (!q) return; $('q').value = '';
+  ask(q);
+};
+async function ask(q) {                                                  // typed or spoken, same path
   logItem('you', q);
   // The question takes the floor: chatter stops now; a hazard already being spoken may finish its sentence.
   awaitingAnswer = true;
@@ -323,7 +328,37 @@ $('askform').onsubmit = async e => {
   }
   show(a.text, 'info'); logItem('answer', a.text, a.clip_url);
   if (!speak(a.text, null, 'answer', a.audio_url)) flushHeld();         // muted → still release any held hazard
-};
+}
+
+// ---------- voice input (owner: C): hold 🎤 or Space, talk, let go → it asks ------------
+// Chrome/Edge speech recognition (works on localhost or https). While the person talks the agent
+// keeps quiet — chatter is cut and hazards come as beeps only — so it never hears itself.
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, heard = '';
+function listenStart() {
+  if (!SR || rec) return;
+  AC.resume();
+  awaitingAnswer = true;
+  if (playing && playing.prio < PRIO.urgent) silence();
+  heard = '';
+  rec = new SR(); rec.lang = 'en-GB'; rec.interimResults = true; rec.continuous = true;
+  rec.onresult = e => { heard = Array.from(e.results).map(r => r[0].transcript).join(' ').trim(); $('q').value = heard; };
+  rec.onerror = e => { $('status').textContent = 'mic: ' + e.error; };
+  rec.onend = () => {
+    rec = null; $('mic').classList.remove('on'); $('mic').textContent = '🎤 Hold to talk';
+    const q = heard.trim(); $('q').value = '';
+    if (q) ask(q); else { awaitingAnswer = false; flushHeld(); }        // heard nothing: back to normal
+  };
+  rec.start();
+  $('mic').classList.add('on'); $('mic').textContent = '🎙 Listening… let go to ask';
+}
+function listenStop() { if (rec) rec.stop(); }
+if (!SR) { $('mic').disabled = true; $('mic').title = 'Voice input needs Chrome or Edge'; }
+$('mic').addEventListener('pointerdown', e => { e.preventDefault(); listenStart(); });
+['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => $('mic').addEventListener(ev, listenStop));
+const typing = () => document.activeElement === $('q');
+document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && !typing()) { e.preventDefault(); listenStart(); } });
+document.addEventListener('keyup', e => { if (e.code === 'Space' && !typing()) { e.preventDefault(); listenStop(); } });
 $('persona').onchange = e => fetch('/persona', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ persona: e.target.value }) });
 $('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇 muted' : '🔊 sound on'; if (muted) stopAll(); };
 $('start').onclick = () => start().catch(err => { $('status').textContent = 'camera error: ' + err.message; });
