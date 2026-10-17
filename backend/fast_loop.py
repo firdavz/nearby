@@ -60,14 +60,24 @@ def detect_fake(frame: np.ndarray) -> list[Detection]:
 _model = None
 
 
-def detect_real(frame: np.ndarray) -> list[Detection]:
+def _track(frame: np.ndarray):
+    return _model.track(frame, persist=True, verbose=False, device=config.YOLO_DEVICE,
+                        tracker="bytetrack.yaml", conf=0.35)[0]
+
+
+def _load() -> None:
+    """Load weights and run one blank frame, so the first camera frame isn't a multi-second stall."""
     global _model
     if _model is None:
         from ultralytics import YOLO
         _model = YOLO(config.YOLO_WEIGHTS)
+        _track(np.zeros((480, 640, 3), np.uint8))
+
+
+def detect_real(frame: np.ndarray) -> list[Detection]:
+    _load()
     H, W = frame.shape[:2]
-    r = _model.track(frame, persist=True, verbose=False, device=config.YOLO_DEVICE,
-                     tracker="bytetrack.yaml", conf=0.35)[0]
+    r = _track(frame)
     out: list[Detection] = []
     if r.boxes is None:
         return out
@@ -80,3 +90,5 @@ def detect_real(frame: np.ndarray) -> list[Detection]:
 
 
 detect = detect_real if config.USE_REAL_YOLO else detect_fake
+if config.USE_REAL_YOLO:
+    _load()  # pay the model load at server start, not on the first frame

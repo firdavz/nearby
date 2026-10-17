@@ -9,4 +9,5 @@ boto3
 weave
 wandb
 ultralytics      # only needed with USE_REAL_YOLO=1
+lap>=0.5.12      # ByteTrack needs it; ultralytics' runtime auto-install hangs then fails
 websockets       # scripts/replay.py
