@@ -65,3 +65,9 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "eleven_v3")                     # most human; ~3 s (hazards are pre-rendered)
 ELEVEN_VOICE_CALM = os.getenv("ELEVEN_VOICE_CALM", "cjVigY5qzO86Huf0OWal")  # Eric: smooth, trustworthy, casual
 ELEVEN_VOICE_DOC = os.getenv("ELEVEN_VOICE_DOC", "JBFqnCBsd6RMkjVDRZzb")    # George: warm British storyteller
+
+# W&B Inference wants the OpenAI-Project header as entity/project ("vastdata/team-48"). The lab VM exports
+# WANDB_TEAM=vastdata and the short WANDB_PROJECT=team-48, which gives "400 Invalid Authentication"; join them.
+WANDB_TEAM = os.getenv("WANDB_TEAM", "")
+if WANDB_PROJECT and "/" not in WANDB_PROJECT and WANDB_TEAM:
+    WANDB_PROJECT = f"{WANDB_TEAM}/{WANDB_PROJECT}"

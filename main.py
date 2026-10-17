@@ -103,16 +103,41 @@ def search(q: str):
 
 @app.websocket("/ws/frames")
 async def ws_frames(ws: WebSocket):
+    """One frame in → one JSON reply out, always. The browser keeps a few frames in flight to hide the
+    tunnel round trip; if they pile up faster than detect() runs, we skip to the newest and tell the
+    client how many were skipped so it can keep its in-flight count honest."""
     await ws.accept()
     buf = slow_loop.ClipBuffer()
     seen_labels: set[str] = set()
     clip_dets: list[dict] = []
     n, t_fps = 0, time.time()
+    q: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    async def reader() -> None:
+        try:
+            while True:
+                q.put_nowait(await ws.receive_bytes())
+        except (WebSocketDisconnect, RuntimeError, KeyError):
+            q.put_nowait(None)              # KeyError: a non-binary message; treat like a close
+
+    reader_task = asyncio.create_task(reader())
     try:
         while True:
-            data = await ws.receive_bytes()
+            data = await q.get()
+            dropped = 0
+            while data is not None and not q.empty():   # stale frames waiting → keep only the newest
+                nxt = q.get_nowait()
+                if nxt is None:
+                    data = None
+                    break
+                data, dropped = nxt, dropped + 1
+            if data is None:
+                break
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
+                await ws.send_text(json.dumps({"detections": [], "hazard": False, "say": None,
+                                               "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
+                                               "dropped": dropped}))
                 continue
             t = time.time()
 
@@ -138,9 +163,12 @@ async def ws_frames(ws: WebSocket):
             await ws.send_text(json.dumps({
                 "detections": dets, "hazard": any(is_hazard(d) for d in dets),
                 "say": line, "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
+                "dropped": dropped,
             }))
     except WebSocketDisconnect:
         pass
+    finally:
+        reader_task.cancel()
 
 
 @app.on_event("startup")

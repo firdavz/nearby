@@ -255,7 +255,7 @@ function stopSession() {
   if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
   video.removeAttribute('src'); video.load();
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
-  sending = false; stopAll();
+  sending = false; inflight = 0; stopAll();
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   $('pausebtn').hidden = $('stopbtn').hidden = true;
   $('start').disabled = false; $('status').textContent = 'stopped';
@@ -269,20 +269,27 @@ function hazardTint() {
 }
 // latest scene caption: subtitle bar on the video + the line under "said"
 function setCaption(text) { $('subtitle').textContent = text; $('caption').textContent = text; }
+// Upstream: small JPEGs, a few frames in flight so a slow tunnel round trip (~0.3 s laptop → VM) doesn't
+// cap us at 1/RTT fps. The server replies once per frame and reports frames it skipped, so `inflight`
+// stays honest; a 2 s silence resets it in case a reply was lost.
+const SEND_W = 416, JPEG_Q = 0.5, MAX_INFLIGHT = 3, SEND_MS = 66;
+let inflight = 0, lastReplyAt = 0;
 const off = document.createElement('canvas'); const octx = off.getContext('2d');
 function pump() {
   if (!ws || ws.readyState !== 1) return;
-  if (!sending && !video.paused) {
-    sending = true;
-    off.width = 640; off.height = Math.round(640 * video.videoHeight / video.videoWidth) || 480;
+  if (inflight && Date.now() - lastReplyAt > 2000) inflight = 0;
+  if (inflight < MAX_INFLIGHT && !sending && !video.paused && video.videoWidth) {
+    sending = true; inflight++;
+    off.width = SEND_W; off.height = Math.round(SEND_W * video.videoHeight / video.videoWidth) || 312;
     octx.drawImage(video, 0, 0, off.width, off.height);
-    off.toBlob(b => b.arrayBuffer().then(buf => { ws.send(buf); }), 'image/jpeg', 0.6);
+    off.toBlob(b => { sending = false; if (b && ws.readyState === 1) b.arrayBuffer().then(buf => ws.send(buf)); else inflight--; }, 'image/jpeg', JPEG_Q);
   }
-  setTimeout(pump, 100);   // ~10 fps upstream; backend sets the real pace
+  setTimeout(pump, SEND_MS);   // ~15 fps attempts; MAX_INFLIGHT and the server set the real pace
 }
 function onResult(r) {
-  sending = false;
-  const sx = overlay.width / 640, sy = overlay.height / (off.height || 480);
+  lastReplyAt = Date.now();
+  inflight = Math.max(0, inflight - 1 - (r.dropped || 0));
+  const sx = overlay.width / (off.width || SEND_W), sy = overlay.height / (off.height || 312);
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   for (const d of r.detections) {
     const [x1, y1, x2, y2] = d.box; const haz = d.closing && d.distance === 'near';
@@ -293,7 +300,7 @@ function onResult(r) {
   }
   $('stage').classList.toggle('hazard', r.hazard);
   if (r.hazard) hazardTint();
-  $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects`;
+  $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects` + (r.dropped ? ` · skipped ${r.dropped}` : '');
   if (r.caption) setCaption(r.caption);
   if (r.say) speak(r.say.text, r.say.side, r.say.urgency, r.say.audio_url);   // the speech manager shows + logs what it says
 }

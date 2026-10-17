@@ -156,8 +156,24 @@ def _resolve_model(client) -> str:
     return client.models.list().data[0].id
 
 
+def clip_fps(clip_path: str) -> float:
+    """Frame rate the clip was written at (live clips through a slow tunnel can be exactly 1 fps)."""
+    cap = cv2.VideoCapture(clip_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 0.0
+    cap.release()
+    return fps if fps and fps > 0 else 1.0
+
+
+def _fps_from_error(msg: str) -> float | None:
+    """vLLM says 'Target fps (4.0) must be <= original fps (1.0)'; pull out the original."""
+    m = re.search(r"original fps \(([\d.]+)\)", msg)
+    return float(m.group(1)) if m else None
+
+
 def caption_openai(clip_path: str) -> str:
-    """Self-hosted Cosmos (NIM / vLLM / the hackathon's Cosmos3-Reason). Bearer = COSMOS_API_KEY."""
+    """Self-hosted Cosmos (NIM / vLLM / the hackathon's Cosmos3-Reason). Bearer = COSMOS_API_KEY.
+    The sampling hint is capped at the clip's own fps: Cosmos rejects a target above the source rate,
+    and without any hint it defaults to 4 fps, which fails the same way."""
     from openai import OpenAI, BadRequestError
     client = OpenAI(base_url=config.COSMOS_BASE_URL, api_key=config.COSMOS_API_KEY or "none", timeout=90)
     model = _resolve_model(client)
@@ -166,10 +182,18 @@ def caption_openai(clip_path: str) -> str:
         {"type": "text", "text": PROMPT},
         {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}}]}]
     kwargs = dict(model=model, messages=messages, max_tokens=config.COSMOS_MAX_TOKENS, temperature=0.2)
-    try:  # sampling hint first; some servers reject unknown params → retry plain
-        resp = client.chat.completions.create(**kwargs, extra_body={"media_io_kwargs": {"video": {"fps": float(config.COSMOS_FPS)}}})
-    except BadRequestError:
-        resp = client.chat.completions.create(**kwargs)
+    fps = min(float(config.COSMOS_FPS), clip_fps(clip_path))
+    hint = lambda f: {"media_io_kwargs": {"video": {"fps": round(f, 3)}}}
+    try:
+        resp = client.chat.completions.create(**kwargs, extra_body=hint(fps))
+    except BadRequestError as e:
+        src = _fps_from_error(str(e))
+        if src is not None and src < fps:           # our probe of the clip fps was wrong: trust the server
+            resp = client.chat.completions.create(**kwargs, extra_body=hint(src))
+        elif "media_io_kwargs" in str(e):           # server has no such parameter at all: go plain
+            resp = client.chat.completions.create(**kwargs)
+        else:
+            raise
     return _clean(resp.choices[0].message.content or "")
 
 

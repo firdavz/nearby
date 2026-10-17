@@ -64,8 +64,19 @@ echo "COSMOS_API_KEY=$(grep ^GPU_BEARER_TOKEN= /config/team-48.config | cut -d= 
 sed -i 's/^USE_REAL_COSMOS=.*/USE_REAL_COSMOS=1/; s/^USE_REAL_MEMORY=.*/USE_REAL_MEMORY=1/' .env
 python scripts/smoke.py                                   # real flags
 USE_REAL_COSMOS=0 USE_REAL_MEMORY=0 python scripts/smoke.py   # fakes
-uvicorn main:app --reload --port 8000
+bash scripts/start_vm.sh                                  # exports WANDB_PROJECT=vastdata/team-48, then uvicorn on :8000
 ```
+
+**W&B Inference auth.** The agent sends `OpenAI-Project: <WANDB_PROJECT>` and W&B wants it as `entity/project`,
+so it must be `vastdata/team-48`. The VM shell exports the short `team-48`, which gives `400 Invalid Authentication`,
+and `.env` cannot fix that because `load_dotenv` never overrides a variable already in the environment. Use
+`scripts/start_vm.sh` (it exports the full form), or export `WANDB_PROJECT=vastdata/team-48` yourself before uvicorn.
+`config.py` also joins `WANDB_TEAM` + a short `WANDB_PROJECT` as a safety net.
+
+**Cosmos and clip fps.** Cosmos rejects a sampling hint above the clip's own frame rate ("Target fps (4.0) must be
+<= original fps (1.0)"), and with no hint it defaults to 4. `caption_openai` therefore reads the clip's fps and sends
+`min(COSMOS_FPS, clip_fps)`; a 1 fps live clip captions in about 1.2 s. More frames through the tunnel means clips
+are written at a higher fps and Cosmos gets more to look at.
 
 Cosmos3-Reason is OpenAI-compatible; the clip goes in as a base64 `video_url` with `media_io_kwargs.video.fps=2`
 (about 2-3 s per 5 s clip). Shared GPU host, bearer = `GPU_BEARER_TOKEN`. YOLO11s is on :8002, Embed1 on :8003.
