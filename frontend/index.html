@@ -352,7 +352,8 @@ function onResult(r) {
   }
   $('stage').classList.toggle('hazard', r.hazard);
   if (r.hazard) hazardTint();
-  $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects` + (r.dropped ? ` · skipped ${r.dropped}` : '');
+  $('hud').textContent = `${r.fps} fps · ${r.detections.length} objects` + (r.dropped ? ` · skipped ${r.dropped}` : '')
+    + (r.nav && r.nav.active ? ` · ttc ${r.nav.ttc_ahead == null ? '—' : r.nav.ttc_ahead.toFixed(1) + ' s'}` : '');
   if (r.caption) setCaption(r.caption);
   showCue(r.nav);
   if (r.say) speak(r.say.text, r.say.side, r.say.urgency, r.say.audio_url);   // the speech manager shows + logs what it says

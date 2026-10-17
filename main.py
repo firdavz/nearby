@@ -133,6 +133,11 @@ def search(q: str):
     return memory.search(q)
 
 
+def _nav_json(nav: NavState) -> dict:
+    return {"active": nav.active, "offset": nav.offset, "last": nav.last_cue,
+            "ttc_ahead": round(nav.ttc_ahead, 2) if nav.ttc_ahead is not None else None}
+
+
 @app.websocket("/ws/frames")
 async def ws_frames(ws: WebSocket):
     """One frame in → one JSON reply out, always. The browser keeps a few frames in flight to hide the
@@ -197,7 +202,7 @@ async def ws_frames(ws: WebSocket):
                 await ws.send_text(json.dumps({"detections": [], "hazard": False, "say": None,
                                                "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
                                                "dropped": dropped,
-                                               "nav": {"active": nav.active, "offset": nav.offset, "last": nav.last_cue}}))
+                                               "nav": _nav_json(nav)}))
                 continue
             t = time.time()
 
@@ -249,7 +254,7 @@ async def ws_frames(ws: WebSocket):
                 "detections": dets, "hazard": flash,
                 "say": line, "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
                 "dropped": dropped, "crowded": sum(d["distance"] != "far" for d in dets) >= 3,
-                "nav": {"active": nav.active, "offset": nav.offset, "last": nav.last_cue},
+                "nav": _nav_json(nav),
             }))
     except WebSocketDisconnect:
         pass
