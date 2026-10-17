@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import itertools
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -40,6 +41,10 @@ class ClipBuffer:
             return None
         return self._flush()
 
+    def flush(self) -> Path | None:
+        """Write whatever is buffered now (end of an uploaded video); None if fewer than 3 frames."""
+        return self._flush()
+
     def _flush(self) -> Path | None:
         frames, self.frames = self.frames, []
         elapsed = max(0.5, time.time() - self.started)
@@ -53,26 +58,69 @@ class ClipBuffer:
         return write_mp4(frames, path, fps, W, H)
 
 
+def ffmpeg_exe() -> str | None:
+    """ffmpeg on PATH, else the static binary from the imageio-ffmpeg wheel (pip install imageio-ffmpeg)."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+class Mp4Writer:
+    """Streams BGR frames into a browser-playable H.264 mp4 via ffmpeg stdin, one frame at a time, so an
+    uploaded video of any length never has to sit in memory. Falls back to OpenCV mp4v (not browser-playable)
+    only when no ffmpeg can be found."""
+
+    def __init__(self, path: Path, fps: float, W: int, H: int):
+        self.path, self.W, self.H = Path(path), W, H
+        self.p = None
+        self.vw = None
+        exe = ffmpeg_exe()
+        if exe:
+            try:
+                self.p = subprocess.Popen(
+                    [exe, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                     "-s", f"{W}x{H}", "-r", f"{max(1.0, fps):.2f}", "-i", "-", "-c:v", "libx264", "-preset", "veryfast",
+                     "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(self.path)],
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except (FileNotFoundError, OSError):
+                self.p = None
+        if self.p is None:
+            self.vw = cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps), (W, H))
+
+    def add(self, frame: np.ndarray) -> None:
+        if frame.shape[1] != self.W or frame.shape[0] != self.H:
+            frame = cv2.resize(frame, (self.W, self.H))
+        if self.p is not None:
+            try:
+                self.p.stdin.write(np.ascontiguousarray(frame).tobytes())
+                return
+            except (BrokenPipeError, OSError):          # ffmpeg died mid-way: finish with OpenCV
+                self.p = None
+                self.vw = cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (self.W, self.H))
+        self.vw.write(frame)
+
+    def close(self) -> Path:
+        if self.p is not None:
+            try:
+                self.p.stdin.close(); self.p.wait(timeout=60)
+            except (subprocess.TimeoutExpired, OSError):
+                self.p.kill()
+        if self.vw is not None:
+            self.vw.release()
+        return self.path
+
+
 def write_mp4(frames: list[np.ndarray], path: Path, fps: float, W: int, H: int) -> Path:
     """Browser-playable H.264 via ffmpeg (stdin rawvideo). Falls back to OpenCV mp4v if ffmpeg is missing."""
-    try:
-        p = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
-             "-s", f"{W}x{H}", "-r", f"{fps:.2f}", "-i", "-", "-c:v", "libx264", "-preset", "veryfast",
-             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path)],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        for f in frames:
-            p.stdin.write(np.ascontiguousarray(f).tobytes())
-        p.stdin.close(); p.wait(timeout=30)
-        if p.returncode == 0 and path.exists():
-            return path
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    w = Mp4Writer(path, fps, W, H)
     for f in frames:
-        vw.write(f)
-    vw.release()
-    return path
+        w.add(f)
+    return w.close()
 
 
 # --------------------------------------------------------------------------- FAKE

@@ -73,6 +73,20 @@
   .cue .quiet { font:600 12.8px/1 var(--body); letter-spacing:.14em; text-transform:uppercase; color:var(--muted) }
   .cue.warn { color:var(--warn) } .cue.urgent { color:var(--urgent) } .cue.info { color:var(--accent) }
   body.guide .cue { display:block } body.guide .stage .bands { display:block } body.guide .log { opacity:.35 }
+  /* uploaded video playback: cue timeline under the stage, band overlay off (it's baked into the video) */
+  .stage.playback .bands { display:none }
+  .timeline { grid-column:1; display:flex; flex-direction:column; gap:10px; padding:14px 16px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius) }
+  .timeline[hidden] { display:none }
+  .timeline .head { display:flex; gap:12px; align-items:center; flex-wrap:wrap; color:var(--muted); font-size:13px }
+  .timeline .head label { display:inline-flex; gap:6px; align-items:center; cursor:pointer }
+  .timeline .track { position:relative; height:10px; border-radius:5px; background:rgba(255,255,255,.08); cursor:pointer }
+  .timeline .track .pos { position:absolute; top:-3px; width:2px; height:16px; background:var(--fg) }
+  .timeline .track .mark { position:absolute; top:0; width:4px; height:10px; border-radius:2px; background:var(--accent) }
+  .timeline .track .mark.warn { background:var(--warn) } .timeline .track .mark.urgent { background:var(--urgent) }
+  .timeline .cues { display:flex; flex-wrap:wrap; gap:6px; max-height:120px; overflow:auto }
+  .timeline .cues button { padding:5px 9px; font-size:13px } .timeline .cues button b { font-weight:600; color:var(--muted); margin-right:6px }
+  .timeline .cues button.warn { border-color:var(--warn) } .timeline .cues button.urgent { border-color:var(--urgent) }
+  .timeline .cues button.now { background:var(--btn-fill) }
   .hud { position:absolute; left:12px; top:12px; background:rgba(11,16,36,.72); border:1px solid var(--border); padding:6px 10px;
          border-radius:8px; font:500 12px/1.3 var(--body); font-variant-numeric:tabular-nums; color:var(--muted) }
   .panel { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; display:flex; flex-direction:column; gap:12px; min-height:0 }
@@ -111,6 +125,8 @@
   <input type="file" id="vfile" accept="video/*" hidden>
   <button id="pausebtn" hidden>⏸ Pause</button>
   <button id="stopbtn" hidden>⏹ Stop</button>
+  <button id="uploadbtn" title="Run a recorded video through the live pipeline and watch it annotated">⬆ Upload video</button>
+  <input type="file" id="ufile" accept="video/*" hidden>
   <button class="primary" id="start">Start camera</button>
 </header>
 
@@ -123,6 +139,15 @@
     <div class="flash"></div>
     <div class="subtitle" id="subtitle"></div>
     <div class="hud" id="hud">—</div>
+  </div>
+  <div class="timeline" id="timeline" hidden>
+    <div class="head">
+      <span id="upstatus">uploading…</span>
+      <span class="sp"></span>
+      <label><input type="checkbox" id="speakcues" checked> Speak cues</label>
+    </div>
+    <div class="track" id="track"><div class="pos" id="trackpos"></div></div>
+    <div class="cues" id="cues"></div>
   </div>
 
   <div class="panel">
@@ -301,6 +326,7 @@ async function start(videoUrl) {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 640 } }, audio: false });
     video.srcObject = stream;
   }
+  video.controls = false; video.ontimeupdate = video.onseeking = video.onended = null; $('stage').classList.remove('playback');
   await video.play();
   overlay.width = video.videoWidth; overlay.height = video.videoHeight;
   if (!ws || ws.readyState > 1) {
@@ -364,6 +390,55 @@ function showCue(nav) {
   const arrow = /stop/.test(t) ? '✋' : /left/.test(t) ? '←' : /right/.test(t) ? '→' : '↑';
   c.className = 'cue ' + (/stop/.test(t) ? 'urgent' : /ease|straight|clear/.test(t) ? 'info' : 'warn');
   c.innerHTML = `<span class="arrow">${arrow}</span>${t}`;
+}
+// ---------- uploaded video → same pipeline on the server → annotated playback (owner: D) ------------
+// POST /upload, poll /upload/<id>/status, then play the annotated mp4 in the stage with a cue timeline.
+// "Speak cues" re-speaks each cue through C's speak path as playback passes its time.
+let upCues = [], upNext = 0, upPoll = null, upDuration = 0;
+async function uploadVideo(file) {
+  stopSession();
+  $('timeline').hidden = false; $('cues').innerHTML = ''; $('track').querySelectorAll('.mark').forEach(m => m.remove());
+  $('upstatus').textContent = `uploading ${file.name}…`; $('status').textContent = 'uploading';
+  const fd = new FormData(); fd.append('file', file); fd.append('fps', '10'); fd.append('mode', guide ? 'guide' : 'describe');
+  let r;
+  try { r = await (await fetch('/upload', { method: 'POST', body: fd })).json(); }
+  catch (e) { $('upstatus').textContent = 'upload failed: ' + e.message; return; }
+  clearInterval(upPoll);
+  upPoll = setInterval(async () => {
+    const st = await (await fetch(r.status_url)).json();
+    $('upstatus').textContent = `${st.state} · ${st.percent}% · ${st.frames} frames · ${st.cues} cues`;
+    $('status').textContent = `processing ${st.percent}%`;
+    if (st.state === 'done') { clearInterval(upPoll); playAnnotated(st); }
+    if (st.state === 'error') { clearInterval(upPoll); $('upstatus').textContent = 'error: ' + st.error; $('status').textContent = 'upload error'; }
+  }, 1000);
+}
+async function playAnnotated(st) {
+  const tl = await (await fetch(st.timeline_url)).json();
+  upCues = tl.filter(e => e.say).map(e => ({ t: e.t, ...e.say })); upNext = 0; upDuration = st.duration || 1;
+  $('upstatus').textContent = `${st.name || 'video'} · ${st.duration}s · ${upCues.length} cues · ${st.mode} mode`;
+  const track = $('track');
+  for (const [i, c] of upCues.entries()) {
+    const m = document.createElement('div'); m.className = 'mark ' + c.urgency; m.style.left = `calc(${100 * c.t / upDuration}% - 2px)`; m.title = `${c.t}s ${c.text}`; track.appendChild(m);
+    const b = document.createElement('button'); b.className = c.urgency; b.innerHTML = `<b>${c.t.toFixed(1)}s</b>${c.text}`; b.dataset.i = i;
+    b.onclick = () => { video.currentTime = Math.max(0, c.t - 0.3); video.play(); };
+    $('cues').appendChild(b);
+  }
+  track.onclick = e => { const f = (e.clientX - track.getBoundingClientRect().left) / track.clientWidth; video.currentTime = f * upDuration; video.play(); };
+  video.srcObject = null; video.loop = false; video.controls = true; video.muted = true; video.src = st.video_url;
+  $('stage').classList.add('playback'); ctx.clearRect(0, 0, overlay.width, overlay.height);
+  $('status').textContent = 'playing annotated video'; $('hud').textContent = `uploaded · ${upCues.length} cues`;
+  video.ontimeupdate = () => {
+    const t = video.currentTime;
+    $('trackpos').style.left = `${100 * t / upDuration}%`;
+    $('cues').querySelectorAll('button').forEach(b => b.classList.toggle('now', upCues[b.dataset.i].t <= t && t < upCues[b.dataset.i].t + 2.5));
+    while (upNext < upCues.length && upCues[upNext].t <= t) {
+      const c = upCues[upNext++];
+      if ($('speakcues').checked && t - c.t < 1.5) speak(c.text, c.side, c.urgency, c.audio_url);
+    }
+  };
+  video.onseeking = () => { upNext = upCues.findIndex(c => c.t >= video.currentTime); if (upNext < 0) upNext = upCues.length; };
+  video.onended = () => $('status').textContent = 'annotated video ended';
+  await video.play().catch(() => {});
 }
 // 400 ms translucent red wash over the video on every hazard frame (re-armed while the hazard persists)
 let tintTimer = null;
@@ -470,6 +545,8 @@ $('mode').onclick = () => setGuide(!guide);
 $('start').onclick = () => { if (guide) compassOn(); return start().catch(err => { $('status').textContent = 'camera error: ' + err.message; }); };
 // "Use video": pick a first-person clip from disk; or open the page with ?video=/clips/name.mp4
 $('usevideo').onclick = () => $('vfile').click();
+$('uploadbtn').onclick = () => $('ufile').click();
+$('ufile').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) uploadVideo(f); };
 $('pausebtn').onclick = togglePause;
 $('stopbtn').onclick = stopSession;
 $('vfile').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) start(URL.createObjectURL(f)).catch(err => { $('status').textContent = 'video error: ' + err.message; }); };

@@ -8,6 +8,8 @@ Wiring:  browser webcam → JPEG frames over WebSocket → detect() every frame 
          frames also go into a ClipBuffer → every CLIP_SECONDS a clip → caption() → store()
          in a background thread (slow path), so the video never freezes.
          POST /ask → agent_ask().  GET /clips/<name> serves saved clips.
+         POST /upload → the same per-frame path (process_frame) over a recorded video in a background
+         thread, paced in real time, writing an annotated mp4 + cue timeline under /uploads/.
 """
 from __future__ import annotations
 
@@ -15,12 +17,14 @@ import asyncio
 import json
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,6 +36,9 @@ from backend.navigate import NavState, guidance_sentence, guide_side, steer
 app = FastAPI(title="Second Sight")
 config.CLIP_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=config.CLIP_DIR), name="clips")
+UPLOAD_DIR = config.ROOT / "data/uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 FRONTEND = Path(__file__).parent / "frontend"
 
 _slow = ThreadPoolExecutor(max_workers=2)
@@ -138,21 +145,99 @@ def _nav_json(nav: NavState) -> dict:
             "ttc_ahead": round(nav.ttc_ahead, 2) if nav.ttc_ahead is not None else None}
 
 
+@dataclass
+class SessionState:
+    """Everything one frame source carries between frames: a websocket connection or an uploaded video.
+    Guide mode is on from the first frame unless the client says otherwise."""
+    live: bool = True                                   # live sessions publish their fps to /state
+    buf: slow_loop.ClipBuffer = field(default_factory=slow_loop.ClipBuffer)
+    seen_labels: set[str] = field(default_factory=set)
+    clip_dets: list[dict] = field(default_factory=list)
+    nav: NavState = field(default_factory=NavState)
+    last_guidance: float = 0.0
+    last_hazard_text: str = ""                          # guide mode repeats an urgent alert at most every 2 s
+    last_hazard_t: float = 0.0
+    last_urgent: float = 0.0
+    n: int = 0
+    t_fps: float = field(default_factory=time.time)
+    fps: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.nav.start(None)
+
+
+def empty_reply(s: SessionState, dropped: int = 0) -> dict:
+    return {"detections": [], "hazard": False, "say": None, "caption": _state["latest_caption"],
+            "fps": round(s.fps, 1), "dropped": dropped, "crowded": False, "nav": _nav_json(s.nav)}
+
+
+def process_frame(frame: np.ndarray, s: SessionState, dropped: int = 0) -> dict:
+    """One frame through the whole pipeline: detect → (guide steering | describe chatter) → clip buffer →
+    slow path. Returns the JSON the websocket sends. Same code for the camera and for uploaded video."""
+    t = time.time()
+    nav = s.nav
+
+    # ---- fast path --------------------------------------------------------------
+    dets = fast_loop.detect(frame)
+    s.seen_labels.update(d["label"] for d in dets)
+    s.clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets)
+    H, W = frame.shape[:2]
+    if nav.active:
+        # guide mode: steering cues, else urgent hazards, else a reasoned phrase at most every 6 s.
+        # No crowding rule, no agent chatter: objects are only described when asked.
+        line = steer(dets, W, H, nav)
+        if line is None:
+            hz = [d for d in dets if is_hazard(d)]
+            if hz:
+                alert = fixed_alert(hz[0])
+                if alert["text"] != s.last_hazard_text or t - s.last_hazard_t >= 2.0:
+                    s.last_hazard_text, s.last_hazard_t = alert["text"], t
+                    line = alert
+        if line is None and t - s.last_guidance >= 6.0:
+            g = guidance_sentence(dets, W, H, _state["latest_caption"])
+            if g:
+                s.last_guidance = t
+                line = {"text": g, "side": guide_side(dets, W, H), "urgency": "info"}
+    else:
+        # scene-level crowding rule first (fast path, fixed text); otherwise C's per-object hazards + chatter
+        line = crowd_alert(dets) or agent.agent_on_events(dets, _state["latest_caption"])
+    if line:
+        with _lock:
+            _log.append({"t": t, "kind": line["urgency"], "text": line["text"]})
+
+    # ---- slow path --------------------------------------------------------------
+    clip = s.buf.add(frame)
+    if clip is not None:
+        _submit_slow(clip, sorted(s.seen_labels), t, s.clip_dets)
+        s.seen_labels, s.clip_dets = set(), []
+
+    # Red flash follows the spoken warning (not raw is_hazard), held while that danger lasts,
+    # so leaning in without a warning doesn't flash.
+    if line and line.get("urgency") == "urgent":
+        s.last_urgent = t
+    flash = t - s.last_urgent < FLASH_HOLD_S and any(is_hazard(d) for d in dets)
+
+    s.n += 1
+    if t - s.t_fps >= 1:
+        s.fps, s.n, s.t_fps = s.n / (t - s.t_fps), 0, t
+        if s.live:
+            _state["fps"] = s.fps
+
+    return {
+        "detections": dets, "hazard": flash,
+        "say": line, "caption": _state["latest_caption"], "fps": round(s.fps, 1),
+        "dropped": dropped, "crowded": sum(d["distance"] != "far" for d in dets) >= 3,
+        "nav": _nav_json(nav),
+    }
+
+
 @app.websocket("/ws/frames")
 async def ws_frames(ws: WebSocket):
     """One frame in → one JSON reply out, always. The browser keeps a few frames in flight to hide the
     tunnel round trip; if they pile up faster than detect() runs, we skip to the newest and tell the
     client how many were skipped so it can keep its in-flight count honest."""
     await ws.accept()
-    buf = slow_loop.ClipBuffer()
-    seen_labels: set[str] = set()
-    clip_dets: list[dict] = []
-    n, t_fps = 0, time.time()
-    last_urgent = 0.0
-    nav = NavState()                        # guide mode: corridor steering, per connection, on by default
-    nav.start(None)
-    last_guidance = 0.0
-    last_hazard = {"text": "", "t": 0.0}   # guide mode repeats an urgent alert at most every 2 s
+    s = SessionState(live=True)
     q: asyncio.Queue[bytes | None] = asyncio.Queue()
 
     def control(text: str) -> None:
@@ -164,11 +249,11 @@ async def ws_frames(ws: WebSocket):
         if m.get("type") == "nav":
             if m.get("action") == "start":
                 h = m.get("heading")
-                nav.start(float(h) if h is not None else None)
+                s.nav.start(float(h) if h is not None else None)
             elif m.get("action") == "stop":
-                nav.stop()
+                s.nav.stop()
         elif m.get("type") == "heading" and m.get("heading") is not None:
-            nav.heading = float(m["heading"])
+            s.nav.heading = float(m["heading"])
 
     async def reader() -> None:
         try:
@@ -199,67 +284,145 @@ async def ws_frames(ws: WebSocket):
                 break
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
-                await ws.send_text(json.dumps({"detections": [], "hazard": False, "say": None,
-                                               "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
-                                               "dropped": dropped,
-                                               "nav": _nav_json(nav)}))
+                await ws.send_text(json.dumps(empty_reply(s, dropped)))
                 continue
-            t = time.time()
-
-            # ---- fast path --------------------------------------------------
-            dets = await asyncio.to_thread(fast_loop.detect, frame)
-            seen_labels.update(d["label"] for d in dets)
-            clip_dets.extend({"label": d["label"], "side": d["side"], "distance": d["distance"]} for d in dets)
-            H, W = frame.shape[:2]
-            if nav.active:
-                # guide mode: steering cues, else urgent hazards, else a reasoned phrase at most every 6 s.
-                # No crowding rule, no agent chatter: objects are only described when asked.
-                line = steer(dets, W, H, nav)
-                if line is None:
-                    hz = [d for d in dets if is_hazard(d)]
-                    if hz:
-                        alert = fixed_alert(hz[0])
-                        if alert["text"] != last_hazard["text"] or t - last_hazard["t"] >= 2.0:
-                            last_hazard.update(text=alert["text"], t=t)
-                            line = alert
-                if line is None and t - last_guidance >= 6.0:
-                    g = guidance_sentence(dets, W, H, _state["latest_caption"])
-                    if g:
-                        last_guidance = t
-                        line = {"text": g, "side": guide_side(dets, W, H), "urgency": "info"}
-            else:
-                # scene-level crowding rule first (fast path, fixed text); otherwise C's per-object hazards + chatter
-                line = crowd_alert(dets) or agent.agent_on_events(dets, _state["latest_caption"])
-            if line:
-                with _lock:
-                    _log.append({"t": t, "kind": line["urgency"], "text": line["text"]})
-
-            # ---- slow path --------------------------------------------------
-            clip = buf.add(frame)
-            if clip is not None:
-                _submit_slow(clip, sorted(seen_labels), t, clip_dets)
-                seen_labels, clip_dets = set(), []
-
-            # Red flash follows the spoken warning (not raw is_hazard), held while that danger lasts,
-            # so leaning in without a warning doesn't flash.
-            if line and line.get("urgency") == "urgent":
-                last_urgent = t
-            flash = t - last_urgent < FLASH_HOLD_S and any(is_hazard(d) for d in dets)
-
-            n += 1
-            if t - t_fps >= 1:
-                _state["fps"], n, t_fps = n / (t - t_fps), 0, t
-
-            await ws.send_text(json.dumps({
-                "detections": dets, "hazard": flash,
-                "say": line, "caption": _state["latest_caption"], "fps": round(_state["fps"], 1),
-                "dropped": dropped, "crowded": sum(d["distance"] != "far" for d in dets) >= 3,
-                "nav": _nav_json(nav),
-            }))
+            reply = await asyncio.to_thread(process_frame, frame, s, dropped)
+            await ws.send_text(json.dumps(reply))
     except WebSocketDisconnect:
         pass
     finally:
         reader_task.cancel()
+
+
+# ---- uploaded video through the same pipeline ------------------------------------------
+_uploads: dict[str, dict] = {}         # id → status dict (guarded by _lock)
+BAND_COLOUR = (120, 120, 120)
+COLOURS = {"haz": (92, 92, 255), "near": (52, 177, 242), "far": (163, 209, 90)}   # BGR of the UI colours
+
+
+def _annotate(frame: np.ndarray, r: dict, cue: str, caption: str) -> np.ndarray:
+    """Boxes + labels, the five band lines, the current cue big at the bottom, the caption as a subtitle."""
+    f = frame.copy()
+    H, W = f.shape[:2]
+    for i in range(1, 5):
+        x = int(W * i / 5)
+        cv2.line(f, (x, 0), (x, H), BAND_COLOUR, 1, cv2.LINE_AA)
+    cv2.line(f, (W // 2, 0), (W // 2, H), (163, 209, 90), 1, cv2.LINE_AA)
+    for d in r["detections"]:
+        x1, y1, x2, y2 = [int(v) for v in d["box"]]
+        haz = d["closing"] and d["distance"] == "near"
+        col = COLOURS["haz"] if haz else COLOURS["near"] if d["distance"] == "near" else COLOURS["far"]
+        cv2.rectangle(f, (x1, y1), (x2, y2), col, 3 if haz else 2)
+        label = f"{d['label']} {d['side']} {d['distance']}" + (" closing" if d["closing"] else "")
+        cv2.putText(f, label, (x1 + 4, max(14, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+    if r["hazard"]:
+        cv2.rectangle(f, (0, 0), (W - 1, H - 1), COLOURS["haz"], 12)
+    y = H - 12
+    if caption:
+        cv2.rectangle(f, (0, y - 22), (W, H), (0, 0, 0), -1)
+        cv2.putText(f, caption[:95], (10, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1, cv2.LINE_AA)
+        y -= 26
+    if cue:
+        (tw, th), _ = cv2.getTextSize(cue, cv2.FONT_HERSHEY_DUPLEX, 1.3, 2)
+        x = max(8, (W - tw) // 2)
+        cv2.putText(f, cue, (x, y - 8), cv2.FONT_HERSHEY_DUPLEX, 1.3, (0, 0, 0), 5, cv2.LINE_AA)
+        cv2.putText(f, cue, (x, y - 8), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2, cv2.LINE_AA)
+    return f
+
+
+def _set_status(uid: str, **kw) -> None:
+    with _lock:
+        _uploads[uid].update(kw)
+
+
+def _process_upload(uid: str, path: Path, fps: float, mode: str) -> None:
+    """Background thread. Reads the video at ~fps, pacing frames in real time so the clip buffer, the
+    time-to-contact estimate and every cooldown behave exactly as they do with a live camera."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        _set_status(uid, state="error", error="cannot open video")
+        return
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    step = max(1, int(round(src_fps / max(0.5, fps))))
+    eff_fps = src_fps / step
+    s = SessionState(live=False)
+    if mode != "guide":
+        s.nav.stop()
+    out = UPLOAD_DIR / f"{uid}.annotated.mp4"
+    writer: slow_loop.Mp4Writer | None = None
+    timeline: list[dict] = []
+    cues = 0
+    last_say, last_say_t = "", 0.0
+    t_start = time.time()
+    i = k = 0
+    _set_status(uid, state="running")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            i += 1
+            if (i - 1) % step:
+                continue
+            h, w = frame.shape[:2]
+            if w != config.FRAME_W:
+                frame = cv2.resize(frame, (config.FRAME_W, int(round(h * config.FRAME_W / w))))
+            target = t_start + k / eff_fps              # real-time pacing
+            now = time.time()
+            if target > now:
+                time.sleep(target - now)
+            r = process_frame(frame, s)
+            t_video = round(k / eff_fps, 2)
+            if r["say"]:
+                cues += 1
+                last_say, last_say_t = r["say"]["text"], time.time()
+            timeline.append({"t": t_video, "say": r["say"], "hazard": r["hazard"], "nav": r["nav"],
+                             "n_dets": len(r["detections"])})
+            cue = last_say if time.time() - last_say_t < 2.5 else (s.nav.last_cue if s.nav.active else "")
+            if writer is None:
+                writer = slow_loop.Mp4Writer(out, eff_fps, frame.shape[1], frame.shape[0])
+            writer.add(_annotate(frame, r, cue, r["caption"]))
+            k += 1
+            if k % 5 == 0:
+                _set_status(uid, percent=min(99, int(100 * i / total)) if total else 0, frames=k, cues=cues)
+        # flush the clip buffer so the tail of the video gets captioned and stored before we say done
+        clip = s.buf.flush()
+        if clip is not None:
+            _slow_path(clip, sorted(s.seen_labels), time.time(), s.clip_dets)
+    except Exception as e:
+        _set_status(uid, state="error", error=str(e))
+        print(f"[upload {uid}] failed: {e}")
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.close()
+    if _uploads[uid].get("state") == "error":
+        return
+    (UPLOAD_DIR / f"{uid}.timeline.json").write_text(json.dumps(timeline))
+    _set_status(uid, state="done", percent=100, frames=k, cues=cues, duration=round(k / eff_fps, 2),
+                video_url=f"/uploads/{uid}.annotated.mp4", timeline_url=f"/uploads/{uid}.timeline.json")
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...), fps: float = Form(10.0), mode: str = Form("guide")):
+    uid = uuid.uuid4().hex[:10]
+    path = UPLOAD_DIR / f"{uid}.mp4"
+    path.write_bytes(await file.read())
+    with _lock:
+        _uploads[uid] = {"id": uid, "state": "queued", "percent": 0, "frames": 0, "cues": 0,
+                         "mode": mode, "fps": fps, "name": file.filename}
+    threading.Thread(target=_process_upload, args=(uid, path, fps, mode), daemon=True).start()
+    return {"id": uid, "status_url": f"/upload/{uid}/status"}
+
+
+@app.get("/upload/{uid}/status")
+def upload_status(uid: str):
+    with _lock:
+        st = _uploads.get(uid)
+        if st is None:
+            raise HTTPException(404, "no such upload")
+        return dict(st)
 
 
 @app.on_event("startup")
