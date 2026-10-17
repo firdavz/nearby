@@ -51,6 +51,7 @@ def _hazard_line(events: list[Detection]) -> AgentLine | None:
     if not hazards:
         return None
     line = fixed_alert(hazards[0])
+    line["text"] = voice.hazard_phrase(hazards[0]["label"], hazards[0]["side"])  # human wording, still no model
     now = time.time()
     same = line["text"] == _last_hazard["text"]
     continuous = now - _last_hazard["seen"] < HAZARD_GONE_S

@@ -15,6 +15,19 @@ import threading
 from backend import config
 
 HAZARD_LABELS = ("person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair", "bench", "door")
+
+# Hazard wording: fixed templates (instant, no model) that sound like a person, not a label read-out.
+_MOVERS = {"person": "someone's", "bicycle": "a bike's", "car": "a car's", "motorcycle": "a motorbike's",
+           "bus": "a bus is", "truck": "a truck's", "dog": "a dog's"}
+_MOVER_WHERE = {"left": "on your left", "right": "on your right", "centre": "straight at you"}
+_STATIC_WHERE = {"left": "just to your left", "right": "just to your right", "centre": "right in front of you"}
+
+
+def hazard_phrase(label: str, side: str) -> str:
+    if label in _MOVERS:
+        return f"Careful, {_MOVERS[label]} coming {_MOVER_WHERE.get(side, 'toward you')}."
+    article = "an" if label[:1] in "aeiou" else "a"
+    return f"Watch out, there's {article} {label} {_STATIC_WHERE.get(side, 'ahead')}."
 _lock = threading.Lock()
 _off = {"why": ""}   # set after a bad key / no credits, so we stop calling for the rest of the run
 
@@ -85,6 +98,6 @@ def warm_hazards() -> None:
         for persona in ("calm", "attenborough"):
             for label in HAZARD_LABELS:
                 for side in ("left", "centre", "right"):
-                    tts(f"{label}, {side}, near", persona)
+                    tts(hazard_phrase(label, side), persona)
 
     threading.Thread(target=run, daemon=True).start()
