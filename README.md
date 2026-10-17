@@ -61,7 +61,7 @@ echo "COSMOS_BASE_URL=http://166.19.38.112:8001/v1" >> .env
 echo "COSMOS_MODEL=nvidia/cosmos3-nano-reasoner" >> .env
 echo "COSMOS_FPS=2" >> .env
 echo "COSMOS_API_KEY=$(grep ^GPU_BEARER_TOKEN= /config/team-48.config | cut -d= -f2-)" >> .env
-sed -i 's/^USE_REAL_COSMOS=.*/USE_REAL_COSMOS=1/; s/^USE_REAL_MEMORY=.*/USE_REAL_MEMORY=1/' .env
+sed -i 's/^USE_REAL_YOLO=.*/USE_REAL_YOLO=1/; s/^USE_REAL_COSMOS=.*/USE_REAL_COSMOS=1/; s/^USE_REAL_MEMORY=.*/USE_REAL_MEMORY=1/' .env
 python scripts/smoke.py                                   # real flags
 USE_REAL_COSMOS=0 USE_REAL_MEMORY=0 python scripts/smoke.py   # fakes
 bash scripts/start_vm.sh                                  # exports WANDB_PROJECT=vastdata/team-48, then uvicorn on :8000
