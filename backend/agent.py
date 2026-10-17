@@ -51,6 +51,15 @@ NOVELTY_S = 45.0        # chatter won't mention the same kind of object again wi
 _DANGER_CLASS = {"car": 0, "bus": 0, "truck": 0, "motorcycle": 0, "bicycle": 1, "person": 2, "dog": 2}
 _hazards: dict[str, dict] = {}            # per object: when it was last seen as a hazard / last warned
 _last_warning = 0.0
+# Someone who has been right in front of the camera for a while (the presenter at a laptop) is not a
+# new danger: leaning toward the camera made their box grow and fired "coming straight at you".
+# A real approach comes from further away, so it has only just become near when it closes in.
+NEAR_FRESH_S = 3.0      # only warn about something that became near within the last few seconds
+_near: dict[str, dict] = {}               # per object: since when it has been near, and last seen near
+
+
+def _key(d: Detection) -> str:
+    return f"{d['label']}:{d['track_id']}" if d["track_id"] >= 0 else d["label"]
 
 
 def _danger_rank(d: Detection) -> tuple:
@@ -63,9 +72,17 @@ def _hazard_line(events: list[Detection]) -> AgentLine | None:
     not every frame: continuous warnings drowned out everything else, including answers."""
     global _last_warning
     now = time.time()
+    for d in events:                      # track how long each object has been near
+        if d["distance"] == "near":
+            st = _near.setdefault(_key(d), {"since": now, "last": now})
+            if now - st["last"] > 1.0:    # it had moved away: a fresh arrival
+                st["since"] = now
+            st["last"] = now
     due = []
     for d in sorted((e for e in events if is_hazard(e)), key=_danger_rank):
-        key = f"{d['label']}:{d['track_id']}" if d["track_id"] >= 0 else d["label"]
+        key = _key(d)
+        if now - _near[key]["since"] > NEAR_FRESH_S:
+            continue                      # been right there for a while: not a new danger
         h = _hazards.setdefault(key, {"warned": 0.0, "seen": 0.0})
         returning = now - h["seen"] > HAZARD_GONE_S
         h["seen"] = now
@@ -230,7 +247,7 @@ def _is_thinking_model() -> bool:
 
 
 def _complete(system: str, user: str) -> str:
-    r = _llm().chat.completions.create(model=config.AGENT_MODEL, temperature=0.2, max_tokens=120,
+    r = _llm().chat.completions.create(model=config.AGENT_MODEL, temperature=0, max_tokens=120,  # 0: no invented details
                                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                                        extra_body=_NO_THINK if _is_thinking_model() else None)
     return (r.choices[0].message.content or "").strip()
@@ -341,7 +358,8 @@ def agent_ask_real(question: str) -> AgentAnswer:
         "Answer the person's question using ONLY the facts below. Say where it was — the [side: ...] phrase "
         "if given, plus the place from the description — and how long ago using the [time: ...] phrase. "
         "Use those phrases exactly as written, without brackets or labels. If the facts don't answer it, "
-        "say you haven't seen it. Never invent places, sides or times. One or two short sentences, spoken aloud as-is.")
+        "say you haven't seen it. Never invent places, rooms, sides or times: if the description says 'on the "
+        "shelf', say 'on the shelf', not 'on the shelf in the kitchen'. One or two short sentences, spoken aloud as-is.")
     user = f"Question: {question}\nFacts:\n" + "\n".join(f"- {f}" for f in found["facts"])
     try:
         text = _complete(sysmsg, user)
