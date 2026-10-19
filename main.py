@@ -33,7 +33,7 @@ from backend import agent, config, fast_loop, memory, slow_loop
 from backend.contracts import crowd_alert, fixed_alert, is_hazard
 from backend.navigate import NavState, guidance_sentence, guide_side, steer
 
-app = FastAPI(title="Second Sight")
+app = FastAPI(title="Nearby")
 config.CLIP_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=config.CLIP_DIR), name="clips")
 UPLOAD_DIR = config.ROOT / "data/uploads"

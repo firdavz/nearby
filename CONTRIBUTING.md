@@ -1,4 +1,4 @@
-# Second Sight — instructions for anyone working in this repo
+# Nearby — instructions for anyone working in this repo
 
 Read this before touching code. Every teammate reads this file, so it is the shared truth.
 

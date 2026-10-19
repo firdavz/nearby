@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start Second Sight on the lab VM with the environment W&B and Cosmos need.  Owner: D.
+# Start Nearby on the lab VM with the environment W&B and Cosmos need.  Owner: D.
 #   bash scripts/start_vm.sh            (from the repo root; tunnel localhost:8000 to your laptop)
 # Anything already exported in your shell beats .env (load_dotenv never overrides), so the W&B project
 # is forced into the entity/project form here, which is what W&B Inference's OpenAI-Project header wants.

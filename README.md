@@ -1,4 +1,4 @@
-# Second Sight — live AI companion for people with sight loss
+# Nearby — live AI companion for people with sight loss
 
 A phone or laptop camera acts as eyes. It warns about hazards with directional sound, stays quiet
 otherwise, and remembers everything it saw — so you can ask *"where are my keys?"* and get the answer
